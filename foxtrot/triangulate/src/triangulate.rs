@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
 use nalgebra_glm as glm;
-use glm::{DVec3, DVec4, DMat4, U32Vec3};
+use glm::{DVec2, DVec3, DVec4, DMat4, U32Vec3};
 use log::{info, warn, error};
 
 #[cfg(feature = "rayon")]
@@ -22,14 +22,25 @@ use nurbs::{BSplineSurface, SampledCurve, SampledSurface, NURBSSurface, KnotVect
 
 const SAVE_DEBUG_SVGS: bool = false;
 const SAVE_PANIC_SVGS: bool = false;
+const MAX_REPRESENTATION_VISITS: usize = 250_000;
+const MAX_CURVE_REFERENCE_DEPTH: usize = 256;
+const MAX_FACE_POINTS: usize = 40_000;
+const MAX_MESH_VERTICES: usize = 4_500_000;
+const MAX_MESH_TRIANGLES: usize = 5_000_000;
 
 /// `TransformStack` is a mapping of representations to transformed children.
 type TransformStack<'a> =
     HashMap<Representation<'a>, Vec<(Representation<'a>, DMat4)>>;
+
+enum RepresentationVisit<'a> {
+    Enter(Representation<'a>, DMat4),
+    Leave(Representation<'a>),
+}
+
 fn build_transform_stack<'a>(s: &'a StepFile, flip: bool) -> TransformStack<'a> {
     // Store a map of parent -> (child, transform)
     let mut transform_stack: HashMap<_, Vec<_>> = HashMap::new();
-    for r in s.0.iter()
+    for r in s.0.values()
         .filter_map(|e|
             RepresentationRelationshipWithTransformation_::try_from_entity(e))
     {
@@ -63,8 +74,8 @@ fn transform_stack_roots<'a>(transform_stack: &TransformStack<'a>) -> Vec<Repres
         .collect()
 }
 
-pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
-    let styled_items: Vec<_> = s.0.iter()
+pub fn triangulate(s: &StepFile) -> Result<(Mesh, Stats), Error> {
+    let styled_items: Vec<_> = s.0.values()
         .filter_map(|e| MechanicalDesignGeometricPresentationRepresentation_::try_from_entity(e))
         .flat_map(|m| m.items.iter())
         .filter_map(|item| s.entity(item.cast::<StyledItem_>()))
@@ -92,7 +103,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
         roots = transform_stack_roots(&transform_stack);
     }
     let mut todo: Vec<_> = roots.into_iter()
-        .map(|v| (v, DMat4::identity()))
+        .map(|v| RepresentationVisit::Enter(v, DMat4::identity()))
         .collect();
     if todo.len() > 1 {
         warn!("Transformation stack has more than one root!");
@@ -101,7 +112,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     // Store a map of ShapeRepresentationRelationships, which some models
     // use to map from axes to specific instances
     let mut shape_rep_relationship: HashMap<Id<_>, Vec<Id<_>>> = HashMap::new();
-    for (r1, r2) in s.0.iter()
+    for (r1, r2) in s.0.values()
         .filter_map(|e| ShapeRepresentationRelationship_::try_from_entity(e))
         .map(|e| (e.rep_1, e.rep_2))
     {
@@ -109,13 +120,37 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     }
 
     let mut to_mesh: HashMap<Id<_>, Vec<_>> = HashMap::new();
-    while let Some((id, mat)) = todo.pop() {
-        for child in shape_rep_relationship.get(&id).unwrap_or(&vec![]) {
-            todo.push((*child, mat));
+    let mut active_path = HashSet::new();
+    let mut visits = 0;
+    let mut instances = 0;
+    while let Some(visit) = todo.pop() {
+        let (id, mat) = match visit {
+            RepresentationVisit::Enter(id, mat) => (id, mat),
+            RepresentationVisit::Leave(id) => {
+                active_path.remove(&id);
+                continue;
+            }
+        };
+        visits += 1;
+        if visits > MAX_REPRESENTATION_VISITS {
+            return Err(Error::RepresentationLimitExceeded);
         }
-        if let Some(children) = transform_stack.get(&id) {
+        if !active_path.insert(id) {
+            return Err(Error::CyclicRepresentation);
+        }
+        let shape_children = shape_rep_relationship.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let transform_children = transform_stack.get(&id);
+        let pending = todo.len() + shape_children.len() + transform_children.map_or(0, Vec::len);
+        if pending > MAX_REPRESENTATION_VISITS {
+            return Err(Error::RepresentationLimitExceeded);
+        }
+        todo.push(RepresentationVisit::Leave(id));
+        for child in shape_children {
+            todo.push(RepresentationVisit::Enter(*child, mat));
+        }
+        if let Some(children) = transform_children {
             for (child, next_mat) in children {
-                todo.push((*child, mat * next_mat));
+                todo.push(RepresentationVisit::Enter(*child, mat * next_mat));
             }
         } else {
             // Bind this transform to the RepresentationItem, which is
@@ -124,6 +159,10 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                 Entity::AdvancedBrepShapeRepresentation(b) => &b.items,
                 Entity::ShapeRepresentation(b) => &b.items,
                 Entity::ManifoldSurfaceShapeRepresentation(b) => &b.items,
+                Entity::GeometricallyBoundedSurfaceShapeRepresentation(_) => {
+                    warn!("Skipping auxiliary bounded surface representation #{}", id.0);
+                    continue;
+                }
                 e => panic!("Could not get shape from {:?}", e),
             };
 
@@ -131,8 +170,13 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                 match &s[*m] {
                     Entity::ManifoldSolidBrep(_)
                     | Entity::BrepWithVoids(_)
-                    | Entity::ShellBasedSurfaceModel(_) =>
-                        to_mesh.entry(*m).or_default().push(mat),
+                    | Entity::ShellBasedSurfaceModel(_) => {
+                        instances += 1;
+                        if instances > MAX_REPRESENTATION_VISITS {
+                            return Err(Error::RepresentationLimitExceeded);
+                        }
+                        to_mesh.entry(*m).or_default().push(mat);
+                    }
                     Entity::Axis2Placement3d(_) => (),
                     e => warn!("Skipping {:?}", e),
                 }
@@ -143,7 +187,6 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     // chain, then draw them individually (with an identity matrix)
     if to_mesh.is_empty() {
         s.0.iter()
-            .enumerate()
             .filter(|(_i, e)|
                 match e {
                     Entity::ManifoldSolidBrep(_)
@@ -152,100 +195,103 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
                     _ => false,
                 }
             )
-            .map(|(i, _e)| Id::new(i))
+            .map(|(&i, _e)| Id::new(i))
             .for_each(|i| to_mesh.entry(i).or_default().push(DMat4::identity()));
     }
 
-    let (to_mesh_iter, empty) = {
-        #[cfg(feature = "rayon")]
-        { (to_mesh.par_iter(), || (Mesh::default(), Stats::default())) }
-        #[cfg(not(feature = "rayon"))]
-        { (to_mesh.iter(), (Mesh::default(), Stats::default())) }
-    };
-    let mesh_fold = to_mesh_iter
-        .fold(
-            // Empty constructor
-            empty,
+    let append_solid = |(mut mesh, mut stats): (Mesh, Stats),
+                        (id, mats): (&RepresentationItem, &Vec<DMat4>)|
+        -> Result<(Mesh, Stats), Error>
+    {
+        let v_start = mesh.verts.len();
+        let t_start = mesh.triangles.len();
+        match &s[*id] {
+            Entity::ManifoldSolidBrep(b) =>
+                closed_shell(s, b.outer, &mut mesh, &mut stats)?,
+            Entity::ShellBasedSurfaceModel(b) =>
+                for v in &b.sbsm_boundary {
+                    shell(s, *v, &mut mesh, &mut stats)?;
+                },
+            Entity::BrepWithVoids(b) =>
+                // TODO: handle voids
+                closed_shell(s, b.outer, &mut mesh, &mut stats)?,
+            _ => {
+                warn!("Skipping {:?} (not a known solid)", s[*id]);
+                return Ok((mesh, stats));
+            },
+        };
 
-            // Fold operation
-            |(mut mesh, mut stats), (id, mats)| {
-                let v_start = mesh.verts.len();
-                let t_start = mesh.triangles.len();
-                match &s[*id] {
-                    Entity::ManifoldSolidBrep(b) =>
-                        closed_shell(s, b.outer, &mut mesh, &mut stats),
-                    Entity::ShellBasedSurfaceModel(b) =>
-                        for v in &b.sbsm_boundary {
-                            shell(s, *v, &mut mesh, &mut stats);
-                        },
-                    Entity::BrepWithVoids(b) =>
-                        // TODO: handle voids
-                        closed_shell(s, b.outer, &mut mesh, &mut stats),
-                    _ => {
-                        warn!("Skipping {:?} (not a known solid)", s[*id]);
-                        return (mesh, stats);
-                    },
-                };
+        // Pick out a color from the color map and apply it to each
+        // newly-created vertex
+        let color = brep_colors.get(id)
+            .map(|c| *c)
+            .unwrap_or(DVec3::new(0.5, 0.5, 0.5));
 
-                // Pick out a color from the color map and apply it to each
-                // newly-created vertex
-                let color = brep_colors.get(id)
-                    .map(|c| *c)
-                    .unwrap_or(DVec3::new(0.5, 0.5, 0.5));
+        // Build copies of the mesh by copying and applying transforms
+        let v_end = mesh.verts.len();
+        let t_end = mesh.triangles.len();
+        let copies = mats.len() - 1;
+        enforce_mesh_limit(
+            v_end.saturating_add((v_end - v_start).saturating_mul(copies)),
+            t_end.saturating_add((t_end - t_start).saturating_mul(copies)),
+        )?;
+        for mat in &mats[1..] {
+            for v in v_start..v_end {
+                let p = mesh.verts[v].pos;
+                let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
+                let pos = (mat * p_h).xyz();
 
-                // Build copies of the mesh by copying and applying transforms
-                let v_end = mesh.verts.len();
-                let t_end = mesh.triangles.len();
-                for mat in &mats[1..] {
-                    for v in v_start..v_end {
-                        let p = mesh.verts[v].pos;
-                        let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
-                        let pos = (mat * p_h).xyz();
+                let n = mesh.verts[v].norm;
+                let norm = (mat * glm::vec3_to_vec4(&n)).xyz();
 
-                        let n = mesh.verts[v].norm;
-                        let norm = (mat * glm::vec3_to_vec4(&n)).xyz();
-
-                        mesh.verts.push(mesh::Vertex { pos, norm, color });
-                    }
-                    let offset = mesh.verts.len() - v_end;
-                    for t in t_start..t_end {
-                        let mut tri = mesh.triangles[t];
-                        tri.verts.add_scalar_mut(offset as u32);
-                        mesh.triangles.push(tri);
-                    }
-                }
-
-                // Now that we've built all of the other copies of the mesh,
-                // re-use the original mesh and apply the first transform
-                let mat = mats[0];
-                for v in v_start..v_end {
-                    let p = mesh.verts[v].pos;
-                    let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
-                    mesh.verts[v].pos = (mat * p_h).xyz();
-
-                    let n = mesh.verts[v].norm;
-                    mesh.verts[v].norm = (mat * glm::vec3_to_vec4(&n)).xyz();
-
-                    mesh.verts[v].color = color;
-                }
-                (mesh, stats)
-            });
-
-    let (mesh, stats) = {
-        #[cfg(feature = "rayon")]
-        { mesh_fold.reduce(empty,
-                |a, b| (Mesh::combine(a.0, b.0), Stats::combine(a.1, b.1))) }
-        #[cfg(not(feature = "rayon"))]
-        {
-            mesh_fold
+                mesh.verts.push(mesh::Vertex { pos, norm, color });
+            }
+            let offset = mesh.verts.len() - v_end;
+            for t in t_start..t_end {
+                let mut tri = mesh.triangles[t];
+                tri.verts.add_scalar_mut(offset as u32);
+                mesh.triangles.push(tri);
+            }
         }
+
+        // Now that we've built all of the other copies of the mesh,
+        // re-use the original mesh and apply the first transform
+        let mat = mats[0];
+        for v in v_start..v_end {
+            let p = mesh.verts[v].pos;
+            let p_h = DVec4::new(p.x, p.y, p.z, 1.0);
+            mesh.verts[v].pos = (mat * p_h).xyz();
+
+            let n = mesh.verts[v].norm;
+            mesh.verts[v].norm = (mat * glm::vec3_to_vec4(&n)).xyz();
+
+            mesh.verts[v].color = color;
+        }
+        Ok((mesh, stats))
     };
+
+    #[cfg(not(feature = "rayon"))]
+    let (mesh, stats) = to_mesh.iter().try_fold((Mesh::default(), Stats::default()), append_solid)?;
+
+    #[cfg(feature = "rayon")]
+    let (mesh, stats) = to_mesh.par_iter()
+        .try_fold(|| (Mesh::default(), Stats::default()), append_solid)
+        .try_reduce(
+            || (Mesh::default(), Stats::default()),
+            |a, b| {
+                enforce_mesh_limit(
+                    a.0.verts.len().saturating_add(b.0.verts.len()),
+                    a.0.triangles.len().saturating_add(b.0.triangles.len()),
+                )?;
+                Ok((Mesh::combine(a.0, b.0), Stats::combine(a.1, b.1)))
+            },
+        )?;
 
     info!("num_shells: {}", stats.num_shells);
     info!("num_faces: {}", stats.num_faces);
     info!("num_errors: {}", stats.num_errors);
     info!("num_panics: {}", stats.num_panics);
-    (mesh, stats)
+    Ok((mesh, stats))
 }
 
 fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> DMat4 {
@@ -329,32 +375,53 @@ fn axis2_placement_3d(s: &StepFile, t: Id<Axis2Placement3d_>) -> (DVec3, DVec3, 
     (location, axis, ref_direction)
 }
 
-fn shell(s: &StepFile, c: Shell, mesh: &mut Mesh, stats: &mut Stats) {
+fn enforce_mesh_limit(vertices: usize, triangles: usize) -> Result<(), Error> {
+    if vertices > MAX_MESH_VERTICES || triangles > MAX_MESH_TRIANGLES {
+        return Err(Error::MeshLimitExceeded);
+    }
+    Ok(())
+}
+
+fn shell(s: &StepFile, c: Shell, mesh: &mut Mesh, stats: &mut Stats) -> Result<(), Error> {
     match &s[c] {
         Entity::ClosedShell(_) => closed_shell(s, c.cast(), mesh, stats),
-        Entity::OpenShell(_) => open_shell(s, c.cast(), mesh, stats),
-        h => warn!("Skipping {:?} (unknown Shell type)", h),
-    }
-}
-
-fn open_shell(s: &StepFile, c: OpenShell, mesh: &mut Mesh, stats: &mut Stats) {
-    let cs = s.entity(c).expect("Could not get OpenShell");
-    for face in &cs.cfs_faces {
-        if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
-            error!("Failed to triangulate {:?}: {}", s[*face], err);
+        Entity::OpenShell(_) => {
+            let cs = s.entity(c.cast::<OpenShell_>()).expect("Could not get OpenShell");
+            triangulate_shell_faces(s, &cs.cfs_faces, mesh, stats)
+        }
+        h => {
+            warn!("Skipping {:?} (unknown Shell type)", h);
+            Ok(())
         }
     }
-    stats.num_shells += 1;
 }
 
-fn closed_shell(s: &StepFile, c: ClosedShell, mesh: &mut Mesh, stats: &mut Stats) {
+fn closed_shell(s: &StepFile, c: ClosedShell, mesh: &mut Mesh, stats: &mut Stats) -> Result<(), Error> {
     let cs = s.entity(c).expect("Could not get ClosedShell");
-    for face in &cs.cfs_faces {
-        if let Err(err) = advanced_face(s, face.cast(), mesh, stats) {
-            error!("Failed to triangulate {:?}: {}", s[*face], err);
+    triangulate_shell_faces(s, &cs.cfs_faces, mesh, stats)
+}
+
+fn triangulate_shell_faces(
+    s: &StepFile, faces: &[Face], mesh: &mut Mesh, stats: &mut Stats,
+) -> Result<(), Error> {
+    for face in faces {
+        let start = mesh.verts.len();
+        let first_triangle = mesh.triangles.len();
+        match advanced_face(s, face.cast(), mesh, stats) {
+            Ok(()) if mesh.triangles.len() == first_triangle => mesh.verts.truncate(start),
+            Ok(()) => {}
+            Err(Error::MeshLimitExceeded) => return Err(Error::MeshLimitExceeded),
+            Err(err) => {
+                mesh.verts.truncate(start);
+                mesh.triangles.truncate(first_triangle);
+                stats.num_errors += 1;
+                error!("Failed to triangulate face #{}: {}", face.0, err);
+            }
         }
+        enforce_mesh_limit(mesh.verts.len(), mesh.triangles.len())?;
     }
     stats.num_shells += 1;
+    Ok(())
 }
 
 fn advanced_face(s: &StepFile, f: AdvancedFace, mesh: &mut Mesh,
@@ -373,10 +440,24 @@ fn advanced_face(s: &StepFile, f: AdvancedFace, mesh: &mut Mesh,
     // start collecting them as constrained edges for triangulation
     let mut edges = Vec::new();
     let v_start = mesh.verts.len();
-    let mut num_pts = 0;
+    let mut num_pts = 0usize;
+    let mut contours = Vec::new();
+    let mut contour_points = 0usize;
     for b in &face.bounds {
-        let bound_contours = face_bound(s, *b)?;
+        let contour = face_bound(s, *b)?;
+        contour_points = contour_points.saturating_add(contour.len());
+        if contour_points > MAX_FACE_POINTS {
+            return Err(Error::MeshLimitExceeded);
+        }
+        contours.push(contour);
+    }
+    enforce_mesh_limit(mesh.verts.len() + contour_points, mesh.triangles.len())?;
 
+    if triangulate_periodic_band(&surf, &contours, face.same_sense, mesh)? {
+        return Ok(());
+    }
+
+    for bound_contours in contours {
         match bound_contours.len() {
             // We should always have non-zero items in the contour
             0 => panic!("Got empty contours for {:?}", face),
@@ -500,6 +581,90 @@ fn advanced_face(s: &StepFile, f: AdvancedFace, mesh: &mut Mesh,
     Ok(())
 }
 
+fn triangulate_periodic_band(
+    surface: &Surface,
+    contours: &[Vec<DVec3>],
+    same_sense: bool,
+    mesh: &mut Mesh,
+) -> Result<bool, Error> {
+    let [first, second] = contours else { return Ok(false) };
+    if ![first, second].iter().all(|ring| (4..=256).contains(&ring.len()) && ring.first() == ring.last()) {
+        return Ok(false);
+    }
+    let (min, max, u_open, v_open) = match surface {
+        Surface::BSpline(s) => (DVec2::new(s.surf.min_u(), s.surf.min_v()), DVec2::new(s.surf.max_u(), s.surf.max_v()), s.surf.u_open, s.surf.v_open),
+        Surface::NURBS(s) => (DVec2::new(s.surf.min_u(), s.surf.min_v()), DVec2::new(s.surf.max_u(), s.surf.max_v()), s.surf.u_open, s.surf.v_open),
+        _ => return Ok(false),
+    };
+    if u_open == v_open {
+        return Ok(false);
+    }
+
+    let parameter = |across: f64, around: f64| {
+        let t = if u_open { DVec2::new(across, around) } else { DVec2::new(around, across) };
+        min + (max - min).component_mul(&t)
+    };
+    const AROUND: usize = 64;
+    const ACROSS: usize = 24;
+    let boundary = |across| -> Option<Vec<DVec3>> {
+        (0..=AROUND).map(|i| surface.raise(parameter(across, i as f64 / AROUND as f64))).collect()
+    };
+    let (Some(start), Some(end)) = (boundary(0.0), boundary(1.0)) else { return Ok(false) };
+    if !(rings_match(first, &start) && rings_match(second, &end)
+        || rings_match(first, &end) && rings_match(second, &start))
+    {
+        return Ok(false);
+    }
+
+    let offset = mesh.verts.len();
+    enforce_mesh_limit(offset + (ACROSS + 1) * (AROUND + 1), mesh.triangles.len() + 2 * ACROSS * AROUND)?;
+    let mut vertices = Vec::with_capacity((ACROSS + 1) * (AROUND + 1));
+    for i in 0..=ACROSS {
+        for j in 0..=AROUND {
+            let uv = parameter(i as f64 / ACROSS as f64, j as f64 / AROUND as f64);
+            let Some(pos) = surface.raise(uv) else { return Ok(false) };
+            let normal = surface.normal(pos, uv);
+            if !pos.iter().chain(normal.iter()).all(|coordinate| coordinate.is_finite()) {
+                return Ok(false);
+            }
+            let norm = if same_sense { normal } else { -normal };
+            vertices.push(mesh::Vertex { pos, norm, color: DVec3::zeros() });
+        }
+    }
+    mesh.verts.extend(vertices);
+    for i in 0..ACROSS {
+        for j in 0..AROUND {
+            let a = (offset + i * (AROUND + 1) + j) as u32;
+            let b = a + (AROUND + 1) as u32;
+            let (x, y) = if same_sense == u_open { (b, a + 1) } else { (a + 1, b) };
+            mesh.triangles.push(Triangle { verts: U32Vec3::new(a, x, y) });
+            mesh.triangles.push(Triangle { verts: U32Vec3::new(y, x, b + 1) });
+        }
+    }
+    Ok(true)
+}
+
+fn rings_match(a: &[DVec3], b: &[DVec3]) -> bool {
+    let scale = a.iter().map(|point| (point - a[0]).norm()).fold(0.0, f64::max);
+    if !scale.is_finite() || scale <= 0.0 || (b[0] - b[b.len() - 1]).norm() > scale * 1e-6 {
+        return false;
+    }
+    let tolerance = (scale * 0.002).powi(2);
+    let near_ring = |point: &DVec3, ring: &[DVec3]| {
+        ring.windows(2).any(|segment| {
+            let direction = segment[1] - segment[0];
+            let length = direction.norm_squared();
+            let nearest = if length > 0.0 {
+                segment[0] + direction * ((point - segment[0]).dot(&direction) / length).clamp(0.0, 1.0)
+            } else {
+                segment[0]
+            };
+            (point - nearest).norm_squared() <= tolerance
+        })
+    };
+    a.iter().all(|point| near_ring(point, b)) && b.iter().all(|point| near_ring(point, a))
+}
+
 fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
     match &s[surf] {
         Entity::CylindricalSurface(c) => {
@@ -529,22 +694,7 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
         },
         Entity::BSplineSurfaceWithKnots(b) =>
         {
-            // TODO: make KnotVector::from_multiplicies accept iterators?
-            let u_knots: Vec<f64> = b.u_knots.iter().map(|k| k.0).collect();
-            let u_multiplicities: Vec<usize> = b.u_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let u_knot_vec = KnotVector::from_multiplicities(
-                b.u_degree.try_into().expect("Got negative degree"),
-                &u_knots, &u_multiplicities);
-
-            let v_knots: Vec<f64> = b.v_knots.iter().map(|k| k.0).collect();
-            let v_multiplicities: Vec<usize> = b.v_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let v_knot_vec = KnotVector::from_multiplicities(
-                b.v_degree.try_into().expect("Got negative degree"),
-                &v_knots, &v_multiplicities);
+            let (u_knot_vec, v_knot_vec) = surface_knots(b)?;
 
             let control_points_list = control_points_2d(s, &b.control_points_list);
 
@@ -571,22 +721,7 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
                 return Err(Error::UnknownCurveType)
             };
 
-            // TODO: make KnotVector::from_multiplicies accept iterators?
-            let u_knots: Vec<f64> = bspline.u_knots.iter().map(|k| k.0).collect();
-            let u_multiplicities: Vec<usize> = bspline.u_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let u_knot_vec = KnotVector::from_multiplicities(
-                bspline.u_degree.try_into().expect("Got negative degree"),
-                &u_knots, &u_multiplicities);
-
-            let v_knots: Vec<f64> = bspline.v_knots.iter().map(|k| k.0).collect();
-            let v_multiplicities: Vec<usize> = bspline.v_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let v_knot_vec = KnotVector::from_multiplicities(
-                bspline.v_degree.try_into().expect("Got negative degree"),
-                &v_knots, &v_multiplicities);
+            let (u_knot_vec, v_knot_vec) = surface_knots(bspline)?;
 
             let control_points_list = control_points_2d(
                     s, &bspline.control_points_list)
@@ -614,6 +749,55 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
             Err(Error::UnknownSurfaceType)
         },
     }
+}
+
+fn surface_knots(surface: &BSplineSurfaceWithKnots_) -> Result<(KnotVector, KnotVector), Error> {
+    let rows = &surface.control_points_list;
+    let columns = rows.first().map_or(0, Vec::len);
+    if !rows.iter().all(|row| row.len() == columns) {
+        return Err(Error::InvalidKnots);
+    }
+    let u = validated_knots(
+        surface.u_degree, surface.u_knots.iter().map(|k| k.0), &surface.u_multiplicities, rows.len(),
+    )?;
+    let v = validated_knots(
+        surface.v_degree, surface.v_knots.iter().map(|k| k.0), &surface.v_multiplicities, columns,
+    )?;
+    Ok((u, v))
+}
+
+fn validated_knots(
+    degree: i64,
+    knots: impl Iterator<Item = f64>,
+    multiplicities: &[i64],
+    control_points: usize,
+) -> Result<KnotVector, Error> {
+    let degree: usize = degree.try_into().map_err(|_| Error::InvalidKnots)?;
+    if degree == 0 || degree > 32 || degree >= control_points {
+        return Err(Error::InvalidKnots);
+    }
+    let knots: Vec<_> = knots.collect();
+    if knots.len() != multiplicities.len()
+        || knots.len() < 2
+        || !knots.iter().all(|k| k.is_finite())
+        || knots.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(Error::InvalidKnots);
+    }
+
+    let counts: Vec<usize> = multiplicities.iter().map(|&count| {
+        let count: usize = count.try_into().map_err(|_| Error::InvalidKnots)?;
+        if count == 0 || count > degree + 1 {
+            return Err(Error::InvalidKnots);
+        }
+        Ok(count)
+    }).collect::<Result<_, _>>()?;
+    let expanded_count = counts.iter().try_fold(0usize, |total, &count| total.checked_add(count));
+    let expected_count = control_points.checked_add(degree + 1).ok_or(Error::InvalidKnots)?;
+    if expanded_count != Some(expected_count) {
+        return Err(Error::InvalidKnots);
+    }
+    Ok(KnotVector::from_multiplicities(degree, &knots, &counts))
 }
 
 fn control_points_1d(s: &StepFile, row: &Vec<CartesianPoint>) -> Vec<DVec3> {
@@ -661,6 +845,9 @@ fn edge_loop(s: &StepFile, edge_list: &[OrientedEdge])
         }
         let edge = s.entity(*e).expect("Could not get OrientedEdge");
         let o = edge_curve(s, edge.edge_element.cast(), edge.orientation)?;
+        if out.len().saturating_add(o.len()) > MAX_FACE_POINTS {
+            return Err(Error::MeshLimitExceeded);
+        }
         out.extend(o.into_iter());
     }
     Ok(out)
@@ -677,13 +864,26 @@ fn edge_curve(s: &StepFile, e: EdgeCurve, orientation: bool) -> Result<Vec<DVec3
     };
     let u = vertex_point(s, start);
     let v = vertex_point(s, end);
-    Ok(curve.build(u, v))
+    Ok(curve.build(u, v, start == end, edge_curve.same_sense ^ !orientation))
 }
 
-fn curve(s: &StepFile, edge_curve: &ap214::EdgeCurve_,
-         curve_id: ap214::Curve, orientation: bool) -> Result<Curve, Error>
+fn curve<'a>(s: &StepFile<'a>, edge_curve: &ap214::EdgeCurve_<'a>,
+         mut curve_id: ap214::Curve<'a>, orientation: bool) -> Result<Curve, Error>
 {
-    Ok(match &s[curve_id] {
+    let mut aliases = 0;
+    let geometry = loop {
+        let next = match &s[curve_id] {
+            Entity::SurfaceCurve(v) => v.curve_3d,
+            Entity::SeamCurve(v) => v.curve_3d,
+            geometry => break geometry,
+        };
+        aliases += 1;
+        if aliases > MAX_CURVE_REFERENCE_DEPTH {
+            return Err(Error::CurveReferenceLimitExceeded);
+        }
+        curve_id = next;
+    };
+    Ok(match geometry {
         Entity::Circle(c) => {
             let (location, axis, ref_direction) = axis2_placement_3d(s, c.position.cast());
             Curve::new_circle(location, axis, ref_direction, c.radius.0.0.0,
@@ -698,25 +898,22 @@ fn curve(s: &StepFile, edge_curve: &ap214::EdgeCurve_,
                                edge_curve.same_sense ^ !orientation)
         },
         Entity::BSplineCurveWithKnots(c) => {
-            if c.closed_curve.0 != Some(false) {
-                return Err(Error::ClosedCurve);
-            } else if c.self_intersect.0 != Some(false) {
+            if c.self_intersect.0 == Some(true) {
                 return Err(Error::SelfIntersectingCurve);
             }
 
             let control_points_list = control_points_1d(
                 s, &c.control_points_list);
 
-            let knots: Vec<f64> = c.knots.iter().map(|k| k.0).collect();
-            let multiplicities: Vec<usize> = c.knot_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let knot_vec = KnotVector::from_multiplicities(
-                c.degree.try_into().expect("Got negative degree"),
-                &knots, &multiplicities);
+            let knot_vec = validated_knots(
+                c.degree,
+                c.knots.iter().map(|k| k.0),
+                &c.knot_multiplicities,
+                c.control_points_list.len(),
+            )?;
 
             let curve = nurbs::BSplineCurve::new(
-                c.closed_curve.0.unwrap() == false,
+                c.closed_curve.0 != Some(true),
                 knot_vec,
                 control_points_list,
             );
@@ -735,13 +932,18 @@ fn curve(s: &StepFile, edge_curve: &ap214::EdgeCurve_,
                 warn!("Could not get RationalBSplineCurve from {:?}", v[1]);
                 return Err(Error::UnknownCurveType)
             };
-            let knots: Vec<f64> = bspline.knots.iter().map(|k| k.0).collect();
-            let multiplicities: Vec<usize> = bspline.knot_multiplicities.iter()
-                .map(|&k| k.try_into().expect("Got negative multiplicity"))
-                .collect();
-            let knot_vec = KnotVector::from_multiplicities(
-                bspline.degree.try_into().expect("Got negative degree"),
-                &knots, &multiplicities);
+            if bspline.self_intersect.0 == Some(true) {
+                return Err(Error::SelfIntersectingCurve);
+            }
+            if rational.weights_data.len() != bspline.control_points_list.len() {
+                return Err(Error::InvalidKnots);
+            }
+            let knot_vec = validated_knots(
+                bspline.degree,
+                bspline.knots.iter().map(|k| k.0),
+                &bspline.knot_multiplicities,
+                bspline.control_points_list.len(),
+            )?;
 
             let control_points_list = control_points_1d(
                     s, &bspline.control_points_list)
@@ -751,17 +953,11 @@ fn curve(s: &StepFile, edge_curve: &ap214::EdgeCurve_,
                 .collect();
 
             let curve = nurbs::NURBSCurve::new(
-                bspline.closed_curve.0.unwrap() == false,
+                bspline.closed_curve.0 != Some(true),
                 knot_vec,
                 control_points_list,
             );
             Curve::NURBSCurve(SampledCurve::new(curve))
-        },
-        Entity::SurfaceCurve(v) => {
-            curve(s, edge_curve, v.curve_3d, orientation)?
-        },
-        Entity::SeamCurve(v) => {
-            curve(s, edge_curve, v.curve_3d, orientation)?
         },
         // The Line type ignores pnt / dir and just uses u and v
         Entity::Line(_) => Curve::new_line(),

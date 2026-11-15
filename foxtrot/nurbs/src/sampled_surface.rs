@@ -6,149 +6,76 @@ use log::error;
 pub struct SampledSurface<const N: usize> {
     pub surf: NDBSplineSurface<N>,
     samples: Vec<(DVec2, DVec3)>,
+    position_tolerance: f64,
 }
 
 impl<const N: usize> SampledSurface<N>
     where NDBSplineSurface<N>: AbstractSurface
 {
     pub fn new(surf: NDBSplineSurface<N>) -> Self {
-        const N: usize = 8;
-        let mut samples = Vec::new();
-        for i in 0..surf.u_knots.len() - 1 {
-            // Skip multiple knots
-            if surf.u_knots[i] == surf.u_knots[i + 1] {
-                continue;
-            }
-            for j in 0..surf.v_knots.len() - 1 {
-                if surf.v_knots[j] == surf.v_knots[j + 1] {
-                    continue;
-                }
-                // Iterate over a grid within this region
-                for u in 0..N {
-                    let frac = (u as f64) / (N as f64 - 1.0);
-                    let u = surf.u_knots[i] * (1.0 - frac) + surf.u_knots[i + 1] * frac;
-
-                    // Cache the u basis function outside the loop
-                    let u_span = surf.u_knots.find_span(u);
-                    let u_basis = surf.u_knots.basis_funs_for_span(u_span, u);
-                    for v in 0..N {
-                        let frac = (v as f64) / (N as f64 - 1.0);
-                        let v = surf.v_knots[j] * (1.0 - frac) + surf.v_knots[j + 1] * frac;
-                        let uv = DVec2::new(u, v);
-
-                        let v_span = surf.v_knots.find_span(v);
-                        let v_basis = surf.v_knots.basis_funs_for_span(v_span, v);
-                        let q = surf.point_from_basis(
-                            u_span, &u_basis, v_span, &v_basis);
-                        samples.push((uv, q));
-                    }
-                }
+        const STEPS: usize = 32;
+        let mut samples = Vec::with_capacity((STEPS + 1) * (STEPS + 1));
+        for i in 0..=STEPS {
+            let u = surf.min_u() + (surf.max_u() - surf.min_u()) * i as f64 / STEPS as f64;
+            let u_span = surf.u_knots.find_span(u);
+            let u_basis = surf.u_knots.basis_funs_for_span(u_span, u);
+            for j in 0..=STEPS {
+                let v = surf.min_v() + (surf.max_v() - surf.min_v()) * j as f64 / STEPS as f64;
+                let v_span = surf.v_knots.find_span(v);
+                let v_basis = surf.v_knots.basis_funs_for_span(v_span, v);
+                let point = surf.point_from_basis(u_span, &u_basis, v_span, &v_basis);
+                samples.push((DVec2::new(u, v), point));
             }
         }
-        Self { surf, samples }
+        let origin = samples[0].1;
+        let span = samples.iter().map(|(_, point)| (point - origin).norm()).fold(0.0, f64::max);
+        let position_tolerance = (span * 1e-7).max(1e-12);
+        Self { surf, samples, position_tolerance }
     }
 
-    // Section 6.1 (start middle page 232)
-    pub fn uv_from_point_newtons_method(&self, P: DVec3, uv_0: DVec2) -> Option<DVec2> {
-        let eps1 = 0.01; // a Euclidean distance error bound
-        let eps2 = 0.01; // a cosine error bound
-
-        let mut uv_i = uv_0;
-        for _ in 0..256 {
-            // The surface and its derivatives at uv_i
-            let derivs = self.surf.derivs::<2>(uv_i);
-            let S = derivs[0][0];
-            let S_u = derivs[1][0];
-            let S_v = derivs[0][1];
-            let S_uu = derivs[2][0];
-            let S_uv = derivs[1][1]; // S_vu is the same
-            let S_vv = derivs[0][2];
-            let r = S - P;
-
-            // If |S(uv_i) - P| < \epsilon_1  and
-            //    |S_u(uv_i) dot (S(uv_i) - P)| / |S_u(uv_i)| / |S(uv_i) - P| < \epsilon_2  and
-            //    |S_v(uv_i) dot (S(uv_i) - P)| / |S_v(uv_i)| / |S(uv_i) - P| < \epsilon_2
-            // then we are done
-            if length(&r) < eps1
-                && dot(&r, &S_u).abs() / length(&S_u) / length(&r) < eps2
-                && dot(&r, &S_v).abs() / length(&S_v) / length(&r) < eps2
-            {
-                return Some(uv_i);
+    // Iteratively project a world-space point onto the spline, staying in its domain.
+    pub fn uv_from_point_newtons_method(&self, point: DVec3, initial: DVec2) -> Option<DVec2> {
+        let mut uv = initial;
+        let mut best = (f64::INFINITY, initial);
+        for _ in 0..64 {
+            let derivs = self.surf.derivs::<2>(uv);
+            let offset = derivs[0][0] - point;
+            let distance = length(&offset);
+            if distance < best.0 {
+                best = (distance, uv);
+            }
+            if distance <= self.position_tolerance {
+                return Some(uv);
             }
 
-            // Otherwise, compute uv_{i+1} by computing:
-            // let r(u, v) = S(u, v) - P
-            // let f(u, v) = r(u, v) dot S_u(u, v)
-            // let g(u, v) = r(u, v) dot S_v(u, v)
-            // let K_i = -(f(uv_{i}), g(uv_{i}))
-            // let J_i = [[df/du, df/dv], [dg/du, dg/dv]]
-            //           = [[|S_u|^2 + r dot S_uu, S_u dot S_v + r dot S_uv],
-            //              [S_u dot S_v + r dot S_vu, |S_v|^2 + r dot S_vv]]
-            // let delta_i = (J_i)^{-1} * K_i
-            // let uv_{i+1} = delta_i + uv_i
-            let f = dot(&r, &S_u);
-            let g = dot(&r, &S_v);
-            let K_i = -DVec2::new(f, g);
-            let J_i = symmetric2x2(
-                length2(&S_u) + dot(&r, &S_uu),
-                dot(&S_u, &S_v) + dot(&r, &S_uv),
-                length2(&S_v) + dot(&r, &S_vv),
+            let u_tangent = derivs[1][0];
+            let v_tangent = derivs[0][1];
+            let gradient = DVec2::new(dot(&offset, &u_tangent), dot(&offset, &v_tangent));
+            let hessian = symmetric2x2(
+                length2(&u_tangent) + dot(&offset, &derivs[2][0]),
+                dot(&u_tangent, &v_tangent) + dot(&offset, &derivs[1][1]),
+                length2(&v_tangent) + dot(&offset, &derivs[0][2]),
             );
-            let delta_i = match J_i.try_inverse() {
-                None => return None,
-                Some(m) => m * K_i,
-            };
-            let mut uv_ip1 = uv_i + delta_i;
-
-            // clamp uv_{i+p} by doing:
-            // if u_{i+1} < min_u: u_{i+1} = min_u if u_open else max_u - (min_u - u_{i+1})
-            // if u_{i+1} > max_u: u_{i+1} = max_u if u_open else min_u + (u_{i+1} - max_u)
-            // if v_{i+1} < min_v: v_{i+1} = min_v if v_open else max_v - (min_v - v_{i+1})
-            // if v_{i+1} > max_v: v_{i+1} = max_v if v_open else min_v + (v_{i+1} - max_v)
-
-            if uv_ip1.x < self.surf.min_u() {
-                uv_ip1.x = if self.surf.u_open {
-                    self.surf.min_u()
-                } else {
-                    self.surf.max_u() - (self.surf.min_u() - uv_ip1.x)
-                };
+            let Some(inverse) = hessian.try_inverse() else { break };
+            let candidate = uv - inverse * gradient;
+            if !candidate.iter().all(|value| value.is_finite()) {
+                break;
             }
-            if uv_ip1.x > self.surf.max_u() {
-                uv_ip1.x = if self.surf.u_open {
-                    self.surf.max_u()
-                } else {
-                    self.surf.min_u() + (uv_ip1.x - self.surf.max_u())
-                };
+            let next = DVec2::new(
+                restrict_parameter(candidate.x, self.surf.min_u(), self.surf.max_u(), self.surf.u_open),
+                restrict_parameter(candidate.y, self.surf.min_v(), self.surf.max_v(), self.surf.v_open),
+            );
+            if uv == next {
+                break;
             }
-
-            if uv_ip1.y < self.surf.min_v() {
-                uv_ip1.y = if self.surf.v_open {
-                    self.surf.min_v()
-                } else {
-                    self.surf.max_v() - (self.surf.min_v() - uv_ip1.y)
-                };
-            }
-            if uv_ip1.y > self.surf.max_v() {
-                uv_ip1.y = if self.surf.v_open {
-                    self.surf.max_v()
-                } else {
-                    self.surf.min_v() + (uv_ip1.y - self.surf.max_v())
-                };
-            }
-
-            // If the values didn't change much, we can stop iterating
-            // if |(u_{i+1} - u_i) * S_u(u_i, v_i) + (v_{i+1} - v_i) * S_v(u_i, v_i) | < \epsilon_1
-
-            let delta_i = uv_ip1 - uv_i;
-            if length(&(delta_i.x * S_u + delta_i.y * S_v)) < eps1 {
-                return Some(uv_ip1);
-            }
-
-            // otherwise, iterate again
-            uv_i = uv_ip1;
+            uv = next;
         }
-        error!("Could not find UV coordinates");
-        None
+        if best.0 <= self.position_tolerance * 1000.0 {
+            Some(best.1)
+        } else {
+            error!("Could not find UV coordinates");
+            None
+        }
     }
 
     pub fn uv_from_point(&self, p: DVec3) -> Option<DVec2> {
@@ -158,6 +85,14 @@ impl<const N: usize> SampledSurface<N>
             .min_by_key(|(_uv, pos)| OrderedFloat((pos - p).norm()))
             .unwrap().0;
         self.uv_from_point_newtons_method(p, best_uv)
+    }
+}
+
+fn restrict_parameter(value: f64, min: f64, max: f64, open: bool) -> f64 {
+    if open || (min..=max).contains(&value) {
+        value.clamp(min, max)
+    } else {
+        min + (value - min).rem_euclid(max - min)
     }
 }
 

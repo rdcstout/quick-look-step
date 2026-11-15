@@ -1,39 +1,15 @@
-# GitHub Actions Secrets (macOS Signing + Notarization)
+# GitHub Actions
 
-This repo uses GitHub Actions to archive, sign, and notarize the app. Set the following secrets in
-`Settings -> Secrets and variables -> Actions`.
+The [build workflow](build.yml) uses a read-only job for ordinary source builds and tests. Release-tag pushes also run a separate `release` job that uses a Developer ID Application certificate to sign the app, notarizes the archive with Apple, validates the stapled signature, and attaches the final ZIP to the GitHub release.
 
-## 1) Developer ID Application certificate (.p12)
+Configure the `release` environment before pushing a release tag. Set the `MACOS_DEVELOPMENT_TEAM` variable to the Developer ID team's ID. Restrict the environment to approved release activity and keep credentials in environment secrets.
 
-Create/export a **Developer ID Application** certificate from your keychain, then base64 it.
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERTIFICATE_P12_BASE64` | Base64-encoded Developer ID Application certificate and private key exported as a password-protected `.p12` |
+| `MACOS_CERTIFICATE_PASSWORD` | Password for the `.p12` export |
+| `APPSTORE_CONNECT_API_KEY_ID` | Notarization API key ID |
+| `APPSTORE_CONNECT_API_ISSUER_ID` | App Store Connect issuer ID |
+| `APPSTORE_CONNECT_API_PRIVATE_KEY` | Contents of the notarization key's `.p8` file |
 
-```bash
-# Export your Developer ID Application certificate to a .p12 first.
-base64 -i /path/to/DeveloperIDApplication.p12 | pbcopy
-```
-
-Create secrets:
-
-- `MACOS_CERTIFICATE_P12_BASE64`: base64 output of the .p12
-- `MACOS_CERTIFICATE_PASSWORD`: password used when exporting the .p12
-
-Note: For GitHub releases (outside the Mac App Store), you want a **Developer ID Application**
-certificate. Apple Distribution is for the Mac App Store.
-
-## 2) App Store Connect API key (notarytool)
-
-Create the API key in App Store Connect:
-
-1. App Store Connect -> Users and Access -> Keys -> "+"
-2. Choose a name and role (Developer is sufficient for notarization)
-3. Download the `.p8` file and note the **Key ID** and **Issuer ID**
-
-Create secrets:
-
-- `APPSTORE_CONNECT_API_KEY_ID`: the Key ID (10 characters)
-- `APPSTORE_CONNECT_API_ISSUER_ID`: the Issuer ID (UUID)
-- `APPSTORE_CONNECT_API_PRIVATE_KEY`: contents of the `.p8` file
-
-```bash
-cat /path/to/AuthKey_XXXXXXXXXX.p8 | pbcopy
-```
+See [Development](../../DEVELOPMENT.md) for local builds and Finder verification.

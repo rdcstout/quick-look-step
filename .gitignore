@@ -160,3 +160,7 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Locally built Rust library
+/QuickLookStep/libfoxtrot_universal.a
+/QuickLookStep/libfoxtrot_universal.a.tmp

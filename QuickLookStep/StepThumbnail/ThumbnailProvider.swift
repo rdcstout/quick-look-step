@@ -11,40 +11,65 @@ import Cocoa
 import Metal
 
 class ThumbnailProvider: QLThumbnailProvider {
+    private static let renderQueue = DispatchQueue(
+        label: "com.rdcstout.QuickLookStep.thumbnail",
+        qos: .utility
+    )
+    private static let availableSlots = DispatchSemaphore(value: 4)
+
     override func provideThumbnail(for request: QLFileThumbnailRequest, _ handler: @escaping (QLThumbnailReply?, Error?) -> Void) {
-        // We perform heavy work off the main thread.
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard Self.availableSlots.wait(timeout: .now()) == .success else {
+            handler(nil, NSError(domain: "ThumbnailProvider", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "STEP thumbnail renderer is busy"
+            ]))
+            return
+        }
+
+        Self.renderQueue.async {
+            defer { Self.availableSlots.signal() }
             do {
-                // Build the scene using the shared helper.
-                let scene = try SceneBuilder.scene(for: request.fileURL)
-
-                // Set up an off-screen SceneKit renderer.
-                let renderer = SCNRenderer(device: MTLCreateSystemDefaultDevice(), options: nil)
-                renderer.scene = scene
-                renderer.pointOfView = scene.rootNode.childNode(withName: "camera", recursively: true)
-
-                let pointSize = request.maximumSize
-                let scale = CGFloat(request.scale)
-                let pixelSize = CGSize(width: pointSize.width * scale, height: pointSize.height * scale)
-
-                let t0 = CFAbsoluteTimeGetCurrent()
-                let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling4X)
-                let snapshotMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
-                NSLog("renderer.snapshot finished in %.2f ms", snapshotMs)
-
-                guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                    throw NSError(domain: "ThumbnailProvider", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to create CGImage from snapshot"])
-                }
-
-                let reply = QLThumbnailReply(contextSize: pointSize, drawing: { ctx -> Bool in
-                    ctx.draw(cgImage, in: CGRect(origin: .zero, size: pixelSize))
-                    return true
-                })
-
+                let reply = try autoreleasepool { try Self.renderThumbnail(for: request) }
                 handler(reply, nil)
             } catch {
                 handler(nil, error)
             }
         }
+    }
+
+    private static func renderThumbnail(for request: QLFileThumbnailRequest) throws -> QLThumbnailReply {
+        let pointSize = request.maximumSize
+        let scale = CGFloat(request.scale)
+        let longestEdge = max(pointSize.width, pointSize.height)
+        guard pointSize.width.isFinite, pointSize.height.isFinite,
+              pointSize.width > 0, pointSize.height > 0, scale.isFinite, scale > 0 else {
+            throw NSError(domain: "ThumbnailProvider", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid thumbnail size"
+            ])
+        }
+
+        let renderScale = min(scale, 1024 / longestEdge)
+        let pixelSize = CGSize(
+            width: max(1, (pointSize.width * renderScale).rounded()),
+            height: max(1, (pointSize.height * renderScale).rounded())
+        )
+        let scene = try SceneBuilder.preview(for: request.fileURL).scene
+        scene.background.contents = NSColor(srgbRed: 0.18, green: 0.19, blue: 0.21, alpha: 1)
+        let renderer = SCNRenderer(device: MTLCreateSystemDefaultDevice(), options: nil)
+        renderer.scene = scene
+        renderer.pointOfView = scene.rootNode.childNode(withName: "camera", recursively: true)
+
+        let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling4X)
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw NSError(domain: "ThumbnailProvider", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to create a thumbnail image"
+            ])
+        }
+
+        return QLThumbnailReply(contextSize: pointSize, drawing: { context in
+            // Quick Look can supply a pixel-sized bitmap without a points-to-pixels transform.
+            let bitmapBounds = CGRect(x: 0, y: 0, width: context.width, height: context.height)
+            context.draw(cgImage, in: context.convertToUserSpace(bitmapBounds))
+            return true
+        })
     }
 }

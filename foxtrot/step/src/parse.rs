@@ -5,6 +5,7 @@ use nom::{
     character::complete::{char, digit1},
     combinator::{map, map_res, opt},
     error::*,
+    number::complete::recognize_float,
     sequence::{delimited, preceded, tuple},
     multi::{separated_list0},
 };
@@ -42,9 +43,10 @@ pub(crate) trait Parse<'a> {
 
 impl Parse<'_> for f64 {
     fn parse(s: &str) -> IResult<Self> {
-        match fast_float::parse_partial::<f64, _>(s) {
-            Err(_) => nom_err(s, ErrorKind::Float),
-            Ok((x, n)) => Ok((&s[n..], x)),
+        let (remaining, token) = recognize_float(s)?;
+        match token.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok((remaining, value)),
+            _ => nom_err(s, ErrorKind::Float),
         }
     }
 }

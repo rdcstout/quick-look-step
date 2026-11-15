@@ -15,22 +15,9 @@ https://github.com/user-attachments/assets/339781d5-3b7b-41c0-b411-d992e49ae5bc
 * macOS 14.6 (Sonoma) or newer
 * M1 or above CPU (Apple Silicon)
 
-## 💻 Installing
+## 💻 Building the fork
 
-You can either download `QuickLookStep.app` from the [Releases page](https://github.com/johnboiles/quick-look-step/releases) or via Homebrew:
-
-```sh
-brew tap johnboiles/homebrew-tap
-brew install quicklookstep
-```
-
-After installing, open `QuickLookStep.app` once to enable the extensions.
-
-If for some reason the extensions aren't enabled automatically:
-* Open `System Settings` > `General` > `Login Items and Extensions`
-* Click the (i) next to `QuickLookStep`
-* Turn the switch on for both options under `QuickLookStep`
-* Cick `Done`
+This fork is under development. Follow the [source build and Finder verification instructions](DEVELOPMENT.md) to try it locally. The signed v1.6 download and Homebrew tap belong to the upstream project.
 
 ## 🕶️ Usage
 
@@ -45,30 +32,10 @@ Open a Finder window and select a `.step` or `.stp` file. You should be able to 
 
 ## 🔫 Troubleshooting
 
-If you used older versions of `QuickLookStep.app` (especially <v1.5), make sure to delete them and to empty trash (`Finder` -> `Empty Trash...`). I've noticed macOS will sometimes try to use old extensions from the Trash! Then you should restart Finder:
-
-```sh
-killall Finder
-```
-
-If restarting Finder doesn't make it work, I run this to do everything I know to do to clear the macOS cache:
-
-```sh
-pluginkit -r -u com.johnboiles.QuickLookStep.StepThumbnail
-pluginkit -r -u com.johnboiles.QuickLookStep.StepPreview
-pluginkit -a /Applications/QuickLookStep.app
-qlmanage -r
-qlmanage -r cache
-pluginkit -e use -i com.johnboiles.QuickLookStep.StepThumbnail
-pluginkit -e use -i com.johnboiles.QuickLookStep.StepPreview
-killall QuickLookUIService
-killall Finder
-```
-
-And of course rebooting is also worth trying!
+See [Finder verification](DEVELOPMENT.md#finder-verification) for extension registration and STEP file-type checks.
 
 ## 🤝 Contributing
 
-Let's make this better together. Issues and PRs are welcome.
+See [Contributing](CONTRIBUTING.md) for bug reports and changes.
 
 This project is licensed under the terms of the **MIT License**. Do what you want with it but I don't guarantee it works. If you do something neat with it, I'd always appreciate a shoutout!

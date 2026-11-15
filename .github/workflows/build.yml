@@ -2,83 +2,102 @@ name: Build and Notarize
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:
-      - "release/v*"
+    branches: [main]
+    tags: ["release/v*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
-    runs-on: macos-latest
-
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, xcode-27]
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Select Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          xcode-version: latest-stable
+          persist-credentials: false
+
+      - name: Test and build from source
+        run: |
+          sw_vers
+          rustup show
+          xcodebuild -version
+          make test-foxtrot xcodebuild
+          codesign --verify --deep --strict build/Build/Products/Debug/QuickLookStep.app
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release/v')
+    needs: verify
+    runs-on: macos-26
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build Rust from source
+        run: make libfoxtrot_universal.a
 
       - name: Import signing certificate
-        if: github.event_name != 'pull_request'
-        uses: apple-actions/import-codesign-certs@v7
+        uses: apple-actions/import-codesign-certs@288b8ec97b82c66b6f2a6baaf7acc8dfbcbe331c # v7
         with:
           p12-file-base64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           p12-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
 
-      - name: Archive
+      - name: Archive and sign
+        env:
+          MACOS_DEVELOPMENT_TEAM: ${{ vars.MACOS_DEVELOPMENT_TEAM }}
         run: |
+          : "${MACOS_DEVELOPMENT_TEAM:?Set MACOS_DEVELOPMENT_TEAM in the release environment}"
           xcodebuild \
             -project QuickLookStep/QuickLookStep.xcodeproj \
             -scheme QuickLookStep \
             -configuration Release \
             -destination "generic/platform=macOS" \
             -archivePath "$PWD/build/QuickLookStep.xcarchive" \
+            DEVELOPMENT_TEAM="$MACOS_DEVELOPMENT_TEAM" \
             archive
 
-      - name: Package app
-        run: |
-          APP_PATH="$PWD/build/QuickLookStep.xcarchive/Products/Applications/QuickLookStep.app"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$PWD/build/QuickLookStep.zip"
-
-      - name: Notarize
-        if: startsWith(github.ref, 'refs/tags/release/v')
+      - name: Package, notarize and staple
         env:
           APPSTORE_CONNECT_API_KEY_ID: ${{ secrets.APPSTORE_CONNECT_API_KEY_ID }}
           APPSTORE_CONNECT_API_ISSUER_ID: ${{ secrets.APPSTORE_CONNECT_API_ISSUER_ID }}
           APPSTORE_CONNECT_API_PRIVATE_KEY: ${{ secrets.APPSTORE_CONNECT_API_PRIVATE_KEY }}
         run: |
-          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPSTORE_CONNECT_API_KEY_ID}.p8"
-          echo "$APPSTORE_CONNECT_API_PRIVATE_KEY" > "$API_KEY_PATH"
-          xcrun notarytool submit "$PWD/build/QuickLookStep.zip" \
-            --key "$API_KEY_PATH" \
+          app_path="$PWD/build/QuickLookStep.xcarchive/Products/Applications/QuickLookStep.app"
+          zip_path="$PWD/build/QuickLookStep.zip"
+          umask 077
+          key_path="$(mktemp "$RUNNER_TEMP/quicklookstep-notary.XXXXXXXX")"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s\n' "$APPSTORE_CONNECT_API_PRIVATE_KEY" > "$key_path"
+
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
+          xcrun notarytool submit "$zip_path" --key "$key_path" \
             --key-id "$APPSTORE_CONNECT_API_KEY_ID" \
-            --issuer "$APPSTORE_CONNECT_API_ISSUER_ID" \
-            --wait
+            --issuer "$APPSTORE_CONNECT_API_ISSUER_ID" --wait
+          xcrun stapler staple "$app_path"
+          xcrun stapler validate "$app_path"
+          codesign --verify --deep --strict "$app_path"
+          rm -f "$zip_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
 
-      - name: Staple
-        if: startsWith(github.ref, 'refs/tags/release/v')
-        run: |
-          APP_PATH="$PWD/build/QuickLookStep.xcarchive/Products/Applications/QuickLookStep.app"
-          xcrun stapler staple "$APP_PATH"
-          rm -f "$PWD/build/QuickLookStep.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$PWD/build/QuickLookStep.zip"
-
-      - name: Upload app
-        uses: actions/upload-artifact@v7
+      - name: Upload verified package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: QuickLookStep
           path: build/QuickLookStep.zip
+          if-no-files-found: error
 
       - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/release/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: build/QuickLookStep.zip

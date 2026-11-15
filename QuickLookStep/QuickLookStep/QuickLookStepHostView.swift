@@ -7,9 +7,13 @@ import UniformTypeIdentifiers
 
 /// Root UI used inside the demo host macOS app.  Drop a .step file to view it.
 struct QuickLookStepHostView: View {
+    private static let loadQueue = DispatchQueue(label: "com.rdcstout.QuickLookStep.file", qos: .userInitiated)
+
     @State private var scene: SCNScene? = nil
     @State private var loadError: String? = nil
+    @State private var geometryWarning: String?
     @State private var isTargeted: Bool = false
+    @State private var currentLoad: UUID?
 
     var body: some View {
         ZStack {
@@ -22,10 +26,10 @@ struct QuickLookStepHostView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if let loadError {
+            if let message = loadError ?? geometryWarning {
                 VStack {
                     Spacer()
-                    Text(loadError)
+                    Text(message)
                         .foregroundStyle(.blue)
                         .padding()
                 }
@@ -40,11 +44,21 @@ struct QuickLookStepHostView: View {
             func load(_ provider: NSItemProvider, uti: String) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: uti, options: nil) { item, _ in
-                    defer { group.leave() }
+                    let candidate: URL?
                     if let url = item as? URL {
-                        collected.append(url)
+                        candidate = url
+                    } else if let data = item as? Data {
+                        candidate = URL(dataRepresentation: data, relativeTo: nil)
                     } else if let path = item as? String {
-                        collected.append(URL(fileURLWithPath: path))
+                        candidate = URL(fileURLWithPath: path)
+                    } else {
+                        candidate = nil
+                    }
+                    DispatchQueue.main.async {
+                        if let candidate, candidate.isFileURL {
+                            collected.append(candidate)
+                        }
+                        group.leave()
                     }
                 }
             }
@@ -78,21 +92,28 @@ struct QuickLookStepHostView: View {
     // MARK: - Loading & snapshot
     private func loadStep(_ url: URL) {
         loadError = nil
+        geometryWarning = nil
+        let loadID = UUID()
+        currentLoad = loadID
 
-        // If we’re running sandboxed, we need to open a security-scoped bookmark
-        // before reading the file contents in Rust.
-        let needsSecurity = url.startAccessingSecurityScopedResource()
-        defer {
-            if needsSecurity { url.stopAccessingSecurityScopedResource() }
-        }
+        Self.loadQueue.async {
+            let needsSecurity = url.startAccessingSecurityScopedResource()
+            defer {
+                if needsSecurity { url.stopAccessingSecurityScopedResource() }
+            }
 
-        do {
-            print("Loading STEP at", url.path)
-            scene = try SceneBuilder.scene(for: url)
-        } catch {
-            scene = nil
-            loadError = error.localizedDescription
-            print("Failed to load STEP:", error.localizedDescription)
+            let result = Result { try SceneBuilder.preview(for: url) }
+            DispatchQueue.main.async {
+                guard currentLoad == loadID else { return }
+                switch result {
+                case .success(let preview):
+                    scene = preview.scene
+                    geometryWarning = preview.geometryWarning
+                case .failure(let error):
+                    scene = nil
+                    loadError = error.localizedDescription
+                }
+            }
         }
     }
 }

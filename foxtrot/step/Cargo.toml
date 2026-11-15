@@ -6,7 +6,6 @@ edition = "2018"
 
 [dependencies]
 arrayvec = "0.7.1"
-fast-float = "0.2"
 log = "0.4.14"
 memchr = "2.4.0"
 nom = "6.0"

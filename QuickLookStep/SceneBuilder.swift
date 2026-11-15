@@ -8,34 +8,55 @@ import Quartz
 /// extension so thumbnails and previews look identical before any user
 /// interaction.
 enum SceneBuilder {
+    struct Preview {
+        let scene: SCNScene
+        let geometryWarning: String?
+    }
+
+    enum LoadError: LocalizedError {
+        case unreadable
+        case fileTooLarge
+        case invalidGeometry
+        case noGeometry
+        case geometryLimit
+
+        var errorDescription: String? {
+            switch self {
+            case .unreadable: "QuickLookStep could not read this STEP file."
+            case .fileTooLarge: "This STEP file exceeds the 128 MB preview limit."
+            case .invalidGeometry: "This STEP file contains invalid or unsupported geometry."
+            case .noGeometry: "This STEP file contains no supported solid or surface geometry."
+            case .geometryLimit: "This STEP assembly is too complex to preview."
+            }
+        }
+    }
+
     /// Builds a SceneKit scene containing the geometry loaded from the STEP
     /// file at `url`.
-    /// - Throws: An `NSError` if the STEP file cannot be parsed by the Rust
-    ///           backend.
-    static func scene(for url: URL) throws -> SCNScene {
-        // --- Load via FFI and measure duration ---
+    /// - Throws: A `LoadError` if the STEP file cannot be rendered.
+    static func preview(for url: URL) throws -> Preview {
         var mesh = MeshSlice()
-        let start = CFAbsoluteTimeGetCurrent()
-        let ok = url.path.withCString { cPath in
+        let status = url.path.withCString { cPath in
             foxtrot_load_step(cPath, &mesh)
         }
-        let elapsedMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
-        NSLog("foxtrot_load_step(%@) -> %@ in %.2f ms", url.path, ok ? "OK" : "FAIL", elapsedMs)
-        guard ok else {
-            throw NSError(
-                domain: "SceneBuilder",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to load STEP file"]
-            )
+        switch status {
+        case FoxtrotLoadSuccess: break
+        case FoxtrotLoadUnreadable: throw LoadError.unreadable
+        case FoxtrotLoadTooLarge: throw LoadError.fileTooLarge
+        case FoxtrotLoadNoGeometry: throw LoadError.noGeometry
+        case FoxtrotLoadGeometryLimit: throw LoadError.geometryLimit
+        default: throw LoadError.invalidGeometry
         }
         defer { foxtrot_free_mesh(mesh) }
 
-        // Build SceneKit geometry from the raw buffers.
         let vertexCount = Int(mesh.vert_count)
         let indexCount = Int(mesh.tri_count) * 3
+        guard vertexCount > 0, indexCount > 0, let vertices = mesh.verts, let triangles = mesh.tris else {
+            throw LoadError.noGeometry
+        }
 
         let vertexData = Data(
-            bytes: mesh.verts!,
+            bytes: vertices,
             count: vertexCount * 3 * MemoryLayout<Float>.size
         )
         let vertexSource = SCNGeometrySource(
@@ -49,8 +70,25 @@ enum SceneBuilder {
             dataStride: 3 * MemoryLayout<Float>.size
         )
 
+        var sources = [vertexSource]
+        if let normals = mesh.normals {
+            let components = UnsafeBufferPointer(start: normals, count: vertexCount * 3)
+            if components.allSatisfy(\.isFinite) {
+                sources.append(SCNGeometrySource(
+                    data: Data(bytes: normals, count: vertexData.count),
+                    semantic: .normal,
+                    vectorCount: vertexCount,
+                    usesFloatComponents: true,
+                    componentsPerVector: 3,
+                    bytesPerComponent: MemoryLayout<Float>.size,
+                    dataOffset: 0,
+                    dataStride: 3 * MemoryLayout<Float>.size
+                ))
+            }
+        }
+
         let indexData = Data(
-            bytes: mesh.tris!,
+            bytes: triangles,
             count: indexCount * MemoryLayout<UInt32>.size
         )
         let geometryElement = SCNGeometryElement(
@@ -60,7 +98,7 @@ enum SceneBuilder {
             bytesPerIndex: MemoryLayout<UInt32>.size
         )
 
-        let geometry = SCNGeometry(sources: [vertexSource], elements: [geometryElement])
+        let geometry = SCNGeometry(sources: sources, elements: [geometryElement])
         geometry.firstMaterial = SCNMaterial()
         geometry.firstMaterial?.lightingModel = .blinn
         geometry.firstMaterial?.diffuse.contents = NSColor.white
@@ -82,6 +120,9 @@ enum SceneBuilder {
         // Uniformly scale so the largest dimension maps to `targetSize` units.
         let targetSize: CGFloat = 100.0
         let maxExtent = max(size.x, max(size.y, size.z))
+        guard maxExtent.isFinite, maxExtent > 0 else {
+            throw LoadError.invalidGeometry
+        }
         let scaleFactor = targetSize / maxExtent
         let sf = Float(scaleFactor)
         node.scale = SCNVector3(sf, sf, sf)
@@ -135,6 +176,7 @@ enum SceneBuilder {
         ambientNode.light?.intensity = 300
         scene.rootNode.addChildNode(ambientNode)
 
-        return scene
+        let warning = mesh.omitted_faces > 0 ? "Some surfaces could not be displayed" : nil
+        return Preview(scene: scene, geometryWarning: warning)
     }
 } 

@@ -12,6 +12,7 @@ import SceneKit
 class PreviewViewController: NSViewController, QLPreviewingController {
 
     @IBOutlet var scnView: SCNView!
+    private let geometryWarning = NSTextField(labelWithString: "")
     
     override var nibName: NSNib.Name? {
         return NSNib.Name("PreviewViewController")
@@ -25,6 +26,13 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         scnView.autoenablesDefaultLighting = true
 
         addVersionWatermark()
+        geometryWarning.translatesAutoresizingMaskIntoConstraints = false
+        geometryWarning.isHidden = true
+        view.addSubview(geometryWarning)
+        NSLayoutConstraint.activate([
+            geometryWarning.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            geometryWarning.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10)
+        ])
     }
 
     /*
@@ -39,8 +47,11 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     func preparePreviewOfFile(at url: URL) async throws {
         // Build the scene using our shared helper so that the preview and
         // thumbnail use identical geometry, camera, and lighting.
-        let scene = try SceneBuilder.scene(for: url)
-        scnView.scene = scene
+        let preview = try SceneBuilder.preview(for: url)
+        scnView.scene = preview.scene
+        scnView.pointOfView = preview.scene.rootNode.childNode(withName: "camera", recursively: true)
+        geometryWarning.stringValue = preview.geometryWarning ?? ""
+        geometryWarning.isHidden = preview.geometryWarning == nil
     }
 
     private func addVersionWatermark() {

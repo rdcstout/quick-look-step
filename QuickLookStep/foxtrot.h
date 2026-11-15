@@ -9,9 +9,19 @@ typedef struct MeshSlice {
   const uint32_t *tris;
   uintptr_t vert_count;
   uintptr_t tri_count;
+  uintptr_t omitted_faces;
 } MeshSlice;
 
-bool foxtrot_load_step(const char *path, struct MeshSlice *out_mesh);
+typedef enum FoxtrotLoadStatus {
+  FoxtrotLoadSuccess = 0,
+  FoxtrotLoadUnreadable = 1,
+  FoxtrotLoadTooLarge = 2,
+  FoxtrotLoadInvalid = 3,
+  FoxtrotLoadNoGeometry = 4,
+  FoxtrotLoadGeometryLimit = 5
+} FoxtrotLoadStatus;
+
+FoxtrotLoadStatus foxtrot_load_step(const char *path, struct MeshSlice *out_mesh);
 
 /**
  * Caller must invoke this when the mesh is no longer needed.

@@ -5,6 +5,7 @@ use crate::{abstract_curve::AbstractCurve, nd_curve::NDBSplineCurve};
 pub struct SampledCurve<const N: usize> {
     curve: NDBSplineCurve<N>,
     samples: Vec<(f64, DVec3)>,
+    position_tolerance: f64,
 }
 
 impl<const N: usize> SampledCurve<N>
@@ -22,30 +23,39 @@ impl<const N: usize> SampledCurve<N>
             for u in 0..N {
                 let frac = (u as f64) / (N as f64 - 1.0);
                 let u = curve.knots[i] * (1.0 - frac) + curve.knots[i + 1] * frac;
+                if u < curve.min_u() || u > curve.max_u() {
+                    continue;
+                }
 
                 let q = curve.point(u);
                 samples.push((u, q));
             }
         }
 
-        Self { curve, samples }
+        let origin = samples.first().map_or_else(DVec3::zeros, |(_, point)| *point);
+        let span = samples.iter().map(|(_, point)| (point - origin).norm()).fold(0.0, f64::max);
+        let position_tolerance = (span * 1e-7).max(1e-12);
+        Self { curve, samples, position_tolerance }
     }
 
     // Section 6.1 (start middle page 232)
     pub fn u_from_point_newtons_method(&self, P: DVec3, u_0: f64) -> f64 {
-        let eps1 = 0.01; // a Euclidean distance error bound
-        let eps2 = 0.01; // a cosine error bound
-
+        let min = self.curve.min_u();
+        let max = self.curve.max_u();
         let mut u_i = u_0;
-        loop {
+        let mut best = (f64::INFINITY, u_0);
+        for _ in 0..64 {
             let derivs = self.curve.derivs::<2>(u_i);
             let C = derivs[0];
             let C_p = derivs[1];
             let C_pp = derivs[2];
             let r = C - P;
 
-            // If we are close to the point and close to the right angle, then return
-            if length(&r) <= eps1 && dot(&C_p, &r) / length(&C_p) / length(&r) <= eps2 {
+            let distance = length(&r);
+            if distance < best.0 {
+                best = (distance, u_i);
+            }
+            if distance <= self.position_tolerance {
                 return u_i;
             }
 
@@ -53,31 +63,22 @@ impl<const N: usize> SampledCurve<N>
             // let f(u) = C'(u) dot (C(u) - P)
             // u_{ip1} = u_i - (f(u_i) / f'(u_i)) = u_i - (C'(u_i) dot (C(u_i) - P)) / (C''(u_i) dot (C(u_i) - P) + |C'(u_i)|^2)
             let delta_i = -dot(&C_p, &r) / (dot(&C_pp, &r) + length2(&C_p));
-            let mut u_ip1 = u_i + delta_i;
-
-            // clamp the `u` onto the curve
-            if u_ip1 < self.curve.min_u() {
-                u_ip1 = if self.curve.open {
-                    self.curve.min_u()
-                } else {
-                    self.curve.max_u() - (self.curve.min_u() - u_ip1)
-                };
+            let candidate = u_i + delta_i;
+            if !candidate.is_finite() {
+                break;
             }
-            if u_ip1 > self.curve.max_u() {
-                u_ip1 = if self.curve.open {
-                    self.curve.max_u()
-                } else {
-                    self.curve.min_u() + (u_ip1 - self.curve.max_u())
-                };
-            }
-
-            // if the point didnt move much, return
-            if length(&((u_ip1 - u_i) * C_p)) <= eps1 {
-                return u_ip1;
+            let u_ip1 = if self.curve.open {
+                candidate.clamp(min, max)
+            } else {
+                min + (candidate - min).rem_euclid(max - min)
+            };
+            if u_ip1 == u_i {
+                break;
             }
 
             u_i = u_ip1;
         }
+        best.1
     }
 
     pub fn u_from_point(&self, p: DVec3) -> f64 {
@@ -120,5 +121,23 @@ impl<const N: usize> SampledCurve<N>
             result.reverse();
         }
         result
+    }
+
+    pub fn edge_polyline(&self, start: f64, end: f64, whole_loop: bool, forward: bool) -> Vec<DVec3> {
+        let crosses_seam = if forward { end < start } else { end > start };
+        if self.curve.open || (!whole_loop && !crosses_seam) {
+            return self.as_polyline(start, end, 8);
+        }
+        let limits = (self.curve.min_u(), self.curve.max_u());
+        let (exit, entry) = if forward { (limits.1, limits.0) } else { limits };
+        let mut points = if start == exit {
+            vec![self.curve.point(start)]
+        } else {
+            self.as_polyline(start, exit, 8)
+        };
+        if entry != end {
+            points.extend(self.as_polyline(entry, end, 8).into_iter().skip(1));
+        }
+        points
     }
 }

@@ -62,12 +62,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
-name = "fast-float"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95765f67b4b18863968b4a1bd5bb576f732b29a4a28c7cd84c09fa3e2875f33c"
-
-[[package]]
 name = "foxtrot_ffi"
 version = "0.1.0"
 dependencies = [
@@ -290,7 +284,6 @@ name = "step"
 version = "0.1.0"
 dependencies = [
  "arrayvec 0.7.6",
- "fast-float",
  "log",
  "memchr",
  "nom",
