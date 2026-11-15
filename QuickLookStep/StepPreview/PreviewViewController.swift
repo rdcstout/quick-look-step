@@ -20,7 +20,8 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     override func loadView() {
         super.loadView()
         scnView.allowsCameraControl = true
-        scnView.backgroundColor = .clear
+        // Quick Look needs an opaque SceneKit surface to composite the preview.
+        scnView.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(1)
         scnView.autoenablesDefaultLighting = true
 
         addVersionWatermark()

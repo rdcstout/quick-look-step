@@ -13,7 +13,7 @@
 			<string>Alternate</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>com.johnboiles.step</string>
+				<string>com.rdcstout.quicklookstep.step</string>
 			</array>
 			<key>LSTypeIsPackage</key>
 			<false/>
@@ -33,40 +33,13 @@
 			<key>UTTypeIcons</key>
 			<dict/>
 			<key>UTTypeIdentifier</key>
-			<string>com.johnboiles.step</string>
+			<string>com.rdcstout.quicklookstep.step</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
 				<array>
 					<string>step</string>
 					<string>stp</string>
-				</array>
-				<key>public.mime-type</key>
-				<array>
-					<string>model/step</string>
-				</array>
-			</dict>
-		</dict>
-	</array>
-	<key>UTImportedTypeDeclarations</key>
-	<array>
-		<dict>
-			<key>UTTypeConformsTo</key>
-			<array>
-				<string>public.data</string>
-			</array>
-			<key>UTTypeDescription</key>
-			<string>STEP File (ISO 10303-21)</string>
-			<key>UTTypeIdentifier</key>
-			<string>com.johnboiles.step</string>
-			<key>UTTypeTagSpecification</key>
-			<dict>
-				<key>public.filename-extension</key>
-				<array>
-					<string>step</string>
-					<string>stp</string>
-					<string>STEP</string>
-					<string>STP</string>
 				</array>
 				<key>public.mime-type</key>
 				<array>
