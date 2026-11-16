@@ -15,7 +15,7 @@ enum ReleaseUpdates {
     }
 
     private static let repository = "https://github.com/rdcstout/quick-look-step"
-    private static let assetName = "QuickLookStep-macOS-arm64.zip"
+    private static let assetName = "QuickLookStep-macOS-arm64.dmg"
     private static let endpoint = URL(string: "https://api.github.com/repos/rdcstout/quick-look-step/releases/latest")!
     private static let lastAttemptKey = "updateCheckLastAttempt"
     private static let dismissedVersionKey = "updateCheckDismissedVersion"

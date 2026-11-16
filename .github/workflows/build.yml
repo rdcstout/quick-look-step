@@ -66,7 +66,7 @@ jobs:
             -configuration Release \
             -destination "generic/platform=macOS" \
             -archivePath "$PWD/build/QuickLookStep.xcarchive" \
-            DEVELOPMENT_TEAM="$MACOS_DEVELOPMENT_TEAM" \
+            ARCHS=arm64 DEVELOPMENT_TEAM="$MACOS_DEVELOPMENT_TEAM" \
             archive
 
       - name: Package, notarize and staple
@@ -76,25 +76,23 @@ jobs:
           APPSTORE_CONNECT_API_PRIVATE_KEY: ${{ secrets.APPSTORE_CONNECT_API_PRIVATE_KEY }}
         run: |
           app_path="$PWD/build/QuickLookStep.xcarchive/Products/Applications/QuickLookStep.app"
-          zip_path="$PWD/build/QuickLookStep.zip"
+          dmg_path="$PWD/build/QuickLookStep-macOS-arm64.dmg"
           umask 077
           key_path="$(mktemp "$RUNNER_TEMP/quicklookstep-notary.XXXXXXXX")"
           trap 'rm -f "$key_path"' EXIT
           printf '%s\n' "$APPSTORE_CONNECT_API_PRIVATE_KEY" > "$key_path"
-
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
-          xcrun notarytool submit "$zip_path" --key "$key_path" \
+          identity="$(security find-identity -v -p codesigning | awk '/Developer ID Application/ && !seen++ { print $2 }')"
+          bash scripts/package-macos.sh "$app_path" "$dmg_path" "$identity"
+          xcrun notarytool submit "$dmg_path" --key "$key_path" \
             --key-id "$APPSTORE_CONNECT_API_KEY_ID" \
             --issuer "$APPSTORE_CONNECT_API_ISSUER_ID" --wait
-          xcrun stapler staple "$app_path"
-          xcrun stapler validate "$app_path"
-          codesign --verify --deep --strict "$app_path"
-          rm -f "$zip_path"
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$zip_path"
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          hdiutil verify "$dmg_path"
 
       - name: Upload verified package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: QuickLookStep
-          path: build/QuickLookStep.zip
+          path: build/QuickLookStep-macOS-arm64.dmg
           if-no-files-found: error
