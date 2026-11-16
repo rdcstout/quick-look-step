@@ -34,7 +34,12 @@ impl<const N: usize> SampledSurface<N>
     }
 
     // Iteratively project a world-space point onto the spline, staying in its domain.
-    pub fn uv_from_point_newtons_method(&self, point: DVec3, initial: DVec2) -> Option<DVec2> {
+    fn uv_from_point_newtons_method(
+        &self,
+        point: DVec3,
+        initial: DVec2,
+        allowed_residual: f64,
+    ) -> Option<DVec2> {
         let mut uv = initial;
         let mut best = (f64::INFINITY, initial);
         for _ in 0..64 {
@@ -70,7 +75,7 @@ impl<const N: usize> SampledSurface<N>
             }
             uv = next;
         }
-        if best.0 <= self.position_tolerance * 1000.0 {
+        if best.0 <= allowed_residual {
             Some(best.1)
         } else {
             error!("Could not find UV coordinates");
@@ -78,13 +83,18 @@ impl<const N: usize> SampledSurface<N>
         }
     }
 
-    pub fn uv_from_point(&self, p: DVec3) -> Option<DVec2> {
+    pub fn uv_from_point(&self, p: DVec3, use_periodic_trim: bool) -> Option<DVec2> {
         assert!(!self.samples.is_empty());
         use ordered_float::OrderedFloat;
         let best_uv = self.samples.iter()
             .min_by_key(|(_uv, pos)| OrderedFloat((pos - p).norm()))
             .unwrap().0;
-        self.uv_from_point_newtons_method(p, best_uv)
+        // STEP trim curves are stored separately from the spline surface.
+        // Allow small differences on the periodic trim path, retaining the
+        // original 3D curve samples so the boundary still meets adjacent faces.
+        let residual_factor = if use_periodic_trim { 3000.0 } else { 1000.0 };
+        let allowed_residual = self.position_tolerance * residual_factor;
+        self.uv_from_point_newtons_method(p, best_uv, allowed_residual)
     }
 }
 

@@ -6,6 +6,58 @@ use glm::{DVec2, DVec3, DVec4, DMat4};
 use nurbs::{AbstractSurface, NDBSplineSurface, SampledSurface};
 use crate::{Error, mesh::Vertex};
 
+// A planar annulus represents a spline with one closed parameter without a cut.
+#[derive(Clone, Copy)]
+pub(crate) struct PeriodicChart {
+    min: DVec2,
+    span: DVec2,
+    u_open: bool,
+}
+
+impl PeriodicChart {
+    fn new<const N: usize>(spline: &NDBSplineSurface<N>) -> Option<Self>
+    where NDBSplineSurface<N>: AbstractSurface
+    {
+        if spline.u_open == spline.v_open {
+            return None;
+        }
+        let min = DVec2::new(spline.min_u(), spline.min_v());
+        let span = DVec2::new(spline.max_u(), spline.max_v()) - min;
+        if !span.iter().all(|value| value.is_finite() && *value > 0.0) {
+            return None;
+        }
+        let chart = Self { min, span, u_open: spline.u_open };
+        // The STEP closed flag is a hint. Check that both ends actually meet.
+        for across in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let start = spline.point(chart.parameter(across, 0.0));
+            let end = spline.point(chart.parameter(across, 1.0));
+            let scale = (spline.point(chart.parameter(across, 0.5)) - start).norm();
+            let seam_gap = (end - start).norm();
+            if !seam_gap.is_finite() || !scale.is_finite() || seam_gap > (scale * 1e-6).max(1e-12) {
+                return None;
+            }
+        }
+        Some(chart)
+    }
+
+    fn parameter(self, across: f64, around: f64) -> DVec2 {
+        let normalized = if self.u_open {
+            DVec2::new(across, around)
+        } else {
+            DVec2::new(around, across)
+        };
+        self.min + self.span.component_mul(&normalized)
+    }
+
+    fn flatten(self, uv: DVec2) -> DVec2 {
+        let t = (uv - self.min).component_div(&self.span);
+        // Preserve the winding of the original (u, v) chart.
+        let (across, around) = if self.u_open { (t.x, t.y) } else { (t.y, -t.x) };
+        let (sin, cos) = (2.0 * PI * around).sin_cos();
+        DVec2::new(cos, sin) * (1.0 + across)
+    }
+}
+
 // Represents a surface in 3D space, with a function to project a 3D point
 // on the surface down to a 2D space.
 #[derive(Debug, Clone)]
@@ -115,16 +167,10 @@ impl Surface {
         mat
     }
 
-    fn surf_lower<const N: usize>(p: DVec3, surf: &SampledSurface<N>) -> Result<DVec2, Error>
-        where NDBSplineSurface<N>: AbstractSurface
-    {
-        surf.uv_from_point(p).ok_or(Error::CouldNotLower)
-    }
-
     /// Lowers a 3D point on a specific surface into a 2D space defined by
     /// the surface type.  This should only be called from `lower_verts`,
     /// to ensure that `prepare` is called first.
-    fn lower(&self, p: DVec3) -> Result<DVec2, Error> {
+    fn lower(&self, p: DVec3, use_periodic_trim: bool) -> Result<DVec2, Error> {
         let p_ = DVec4::new(p.x, p.y, p.z, 1.0);
         match self {
             Surface::Plane { mat_i, .. } => {
@@ -187,8 +233,8 @@ impl Surface {
                 };
                 Ok(scale * DVec2::new(x, minor_angle.sin()))
             },
-            Surface::BSpline(surf) => Self::surf_lower(p, surf),
-            Surface::NURBS(surf) => Self::surf_lower(p, surf),
+            Surface::BSpline(surf) => surf.uv_from_point(p, use_periodic_trim).ok_or(Error::CouldNotLower),
+            Surface::NURBS(surf) => surf.uv_from_point(p, use_periodic_trim).ok_or(Error::CouldNotLower),
             Surface::Sphere { mat_i, radius, .. } => {
                 // mat_i is constructed in prepare to be a reasonable basis
                 let p = (mat_i * p_).xyz() / *radius;
@@ -248,25 +294,34 @@ impl Surface {
         }
     }
 
-    pub fn lower_verts(&mut self, verts: &mut [Vertex])
+    pub(crate) fn periodic_chart(&self) -> Option<PeriodicChart> {
+        match self {
+            Surface::BSpline(s) => PeriodicChart::new(&s.surf),
+            Surface::NURBS(s) => PeriodicChart::new(&s.surf),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lower_verts(&mut self, verts: &mut [Vertex], chart: Option<PeriodicChart>)
         -> Result<Vec<(f64, f64)>, Error>
     {
         self.prepare(verts);
         let mut pts = Vec::with_capacity(verts.len());
         for v in verts {
             // Project to the 2D subspace for triangulation
-            let proj = self.lower(v.pos)?;
+            let proj = self.lower(v.pos, chart.is_some())?;
             // Update the surface normal
             v.norm = self.normal(v.pos, proj);
-            pts.push((proj.x, proj.y));
+            let planar = chart.map_or(proj, |chart| chart.flatten(proj));
+            pts.push((planar.x, planar.y));
         }
         // If this is a BSpline surface, calculate an aspect ratio based on the
         // control points net, then use it to transform projected points.  This
         // means that positions in 2D (UV) space are closer to positions in 3D
         // space, so the triangulation is better.
-        let aspect_ratio = match self {
-            Surface::NURBS(surf) => Some(surf.surf.aspect_ratio()),
-            Surface::BSpline(surf) => Some(surf.surf.aspect_ratio()),
+        let aspect_ratio = match (chart, self) {
+            (None, Surface::NURBS(surf)) => Some(surf.surf.aspect_ratio()),
+            (None, Surface::BSpline(surf)) => Some(surf.surf.aspect_ratio()),
             _ => None,
         };
         if let Some(aspect_ratio) = aspect_ratio {
@@ -333,9 +388,30 @@ impl Surface {
         (xmin, xmax, ymin, ymax)
     }
 
-    pub fn add_steiner_points(&self, pts: &mut Vec<(f64, f64)>,
-                                     verts: &mut Vec<Vertex>)
+    pub(crate) fn add_steiner_points(
+        &self,
+        pts: &mut Vec<(f64, f64)>,
+        verts: &mut Vec<Vertex>,
+        chart: Option<PeriodicChart>,
+    )
     {
+        if let Some(chart) = chart {
+            // Interior samples keep triangles local around the curved surface.
+            // The constrained triangulator removes those outside the face bounds.
+            for across in 1..16 {
+                for around in 0..64 {
+                    let uv = chart.parameter(across as f64 / 16.0, (around as f64 + 0.5) / 64.0);
+                    let Some(pos) = self.raise(uv) else { continue };
+                    let norm = self.normal(pos, uv);
+                    if pos.iter().chain(norm.iter()).all(|value| value.is_finite()) {
+                        let pt = chart.flatten(uv);
+                        pts.push((pt.x, pt.y));
+                        verts.push(Vertex { pos, norm, color: DVec3::zeros() });
+                    }
+                }
+            }
+            return;
+        }
         let (xmin, xmax, ymin, ymax) = Self::bbox(&pts);
         let num_pts = match self {
             Surface::Sphere { .. }   => 6,

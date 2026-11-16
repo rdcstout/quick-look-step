@@ -508,9 +508,11 @@ fn advanced_face(s: &StepFile, f: AdvancedFace, mesh: &mut Mesh,
     // _fail_ due to these points, so if that happens, we nuke the point (by
     // assigning it to the first point in the list, which causes it to get
     // deduplicated), then retry.
-    let mut pts = surf.lower_verts(&mut mesh.verts[v_start..])?;
+    let chart = if face.bounds.len() > 1 { surf.periodic_chart() } else { None };
+    let mut pts = surf.lower_verts(&mut mesh.verts[v_start..], chart)?;
     let bonus_points = pts.len();
-    surf.add_steiner_points(&mut pts, &mut mesh.verts);
+    surf.add_steiner_points(&mut pts, &mut mesh.verts, chart);
+    enforce_mesh_limit(mesh.verts.len(), mesh.triangles.len())?;
     let result = std::panic::catch_unwind(|| {
         // TODO: this is only needed because we use pts below to save a debug
         // SVG if this panics.  Once we're confident in never panicking, we
