@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/339781d5-3b7b-41c0-b411-d992e49ae5bc
 
 ## 💻 Building the fork
 
-This fork is under development. Follow the [source build and Finder verification instructions](DEVELOPMENT.md) to try it locally. The signed v1.6 download and Homebrew tap belong to the upstream project.
+Roger Stout maintains this independent fork at [rdcstout/quick-look-step](https://github.com/rdcstout/quick-look-step). Follow the [source build and Finder verification instructions](DEVELOPMENT.md) to try it locally.
 
 ## 🕶️ Usage
 
@@ -38,4 +38,8 @@ See [Finder verification](DEVELOPMENT.md#finder-verification) for extension regi
 
 See [Contributing](CONTRIBUTING.md) for bug reports and changes.
 
-This project is licensed under the terms of the **MIT License**. Do what you want with it but I don't guarantee it works. If you do something neat with it, I'd always appreciate a shoutout!
+## Credits and licensing
+
+John Boiles created the original [Quick Look STEP](https://github.com/johnboiles/quick-look-step) app and identified it as MIT licensed in the original README.
+
+This fork uses Foxtrot from Formlabs and contributors. The vendored source retains its [MIT](foxtrot/LICENSE-MIT) and [Apache 2.0](foxtrot/LICENSE-APACHE) license texts.
