@@ -14,6 +14,7 @@ struct QuickLookStepHostView: View {
     @State private var geometryWarning: String?
     @State private var isTargeted: Bool = false
     @State private var currentLoad: UUID?
+    @State private var showUninstallInstructions = false
 
     var body: some View {
         ZStack {
@@ -33,7 +34,7 @@ struct QuickLookStepHostView: View {
                 }
             }
         }
-        .frame(minWidth: 400, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
+        .frame(minWidth: 420, maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
         .contentShape(Rectangle()) // define hit-test area after sizing
         .onDrop(of: [UTType.fileURL, UTType.url, UTType.item], isTargeted: $isTargeted) { providers in
             var collected: [URL] = []
@@ -95,18 +96,29 @@ struct QuickLookStepHostView: View {
 
             Text("In Finder, select a .step or .stp file and press Space.")
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("First-time setup")
-                    .font(.headline)
-                Text("In System Settings, go to General → Login Items & Extensions → Quick Look and enable the Quick Look STEP extensions.")
-            }
-
-            Text("You can close this app after setup.")
+            Text("Use Quick Look settings to enable or disable the preview and thumbnail extensions. You can close this app after setup.")
                 .foregroundStyle(.secondary)
+
+            HStack {
+                Link("Enable or Disable…", destination: URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension?ExtensionItems")!)
+                    .buttonStyle(.borderedProminent)
+                Button("Uninstall…") {
+                    showUninstallInstructions = true
+                }
+            }
         }
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: 400, alignment: .leading)
         .padding(24)
+        .alert("Uninstall Quick Look STEP", isPresented: $showUninstallInstructions) {
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+                NSApp.terminate(nil)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Move Quick Look STEP to the Trash in Finder to remove the app and its extensions.")
+        }
     }
 
     // MARK: - Loading & snapshot
