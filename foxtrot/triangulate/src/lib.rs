@@ -21,6 +21,9 @@ pub enum Error {
     #[error("The STEP spline has inconsistent knots, multiplicities, or control points")]
     InvalidKnots,
 
+    #[error("The STEP geometry has an invalid axis placement")]
+    InvalidPlacement,
+
     #[error("Could not lower point to 2D for triangulation")]
     CouldNotLower,
 

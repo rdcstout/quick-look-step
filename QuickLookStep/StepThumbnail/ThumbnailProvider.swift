@@ -16,6 +16,9 @@ class ThumbnailProvider: QLThumbnailProvider {
         qos: .utility
     )
     private static let availableSlots = DispatchSemaphore(value: 4)
+    // Accessed only on renderQueue. Share the Metal device across requests,
+    // but release each renderer with its scene and GPU resources.
+    private static let device = MTLCreateSystemDefaultDevice()
 
     override func provideThumbnail(for request: QLFileThumbnailRequest, _ handler: @escaping (QLThumbnailReply?, Error?) -> Void) {
         guard Self.availableSlots.wait(timeout: .now()) == .success else {
@@ -54,11 +57,11 @@ class ThumbnailProvider: QLThumbnailProvider {
         )
         let scene = try SceneBuilder.preview(for: request.fileURL).scene
         scene.background.contents = NSColor(srgbRed: 0.18, green: 0.19, blue: 0.21, alpha: 1)
-        let renderer = SCNRenderer(device: MTLCreateSystemDefaultDevice(), options: nil)
+        let renderer = SCNRenderer(device: device, options: nil)
         renderer.scene = scene
         renderer.pointOfView = scene.rootNode.childNode(withName: "camera", recursively: true)
 
-        let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling4X)
+        let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling2X)
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw NSError(domain: "ThumbnailProvider", code: 3, userInfo: [
                 NSLocalizedDescriptionKey: "Failed to create a thumbnail image"

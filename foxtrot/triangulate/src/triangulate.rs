@@ -37,7 +37,7 @@ enum RepresentationVisit<'a> {
     Leave(Representation<'a>),
 }
 
-fn build_transform_stack<'a>(s: &'a StepFile, flip: bool) -> TransformStack<'a> {
+fn build_transform_stack<'a>(s: &'a StepFile, flip: bool) -> Result<TransformStack<'a>, Error> {
     // Store a map of parent -> (child, transform)
     let mut transform_stack: HashMap<_, Vec<_>> = HashMap::new();
     for r in s.0.values()
@@ -49,16 +49,16 @@ fn build_transform_stack<'a>(s: &'a StepFile, flip: bool) -> TransformStack<'a> 
         } else {
             (r.rep_1, r.rep_2)
         };
-        let mut mat = item_defined_transformation(s, r.transformation_operator.cast());
+        let mut mat = item_defined_transformation(s, r.transformation_operator.cast())?;
         if flip {
-            mat = mat.try_inverse().expect("Could not invert transform matrix");
+            mat = mat.try_inverse().ok_or(Error::InvalidPlacement)?;
         }
 
         transform_stack.entry(b)
             .or_default()
             .push((a, mat));
     }
-    transform_stack
+    Ok(transform_stack)
 }
 
 fn transform_stack_roots<'a>(transform_stack: &TransformStack<'a>) -> Vec<Representation<'a>> {
@@ -91,7 +91,7 @@ pub fn triangulate(s: &StepFile) -> Result<(Mesh, Stats), Error> {
         .collect();
 
     // Store a map of parent -> (child, transform)
-    let mut transform_stack = build_transform_stack(s, false);
+    let mut transform_stack = build_transform_stack(s, false)?;
     let mut roots = transform_stack_roots(&transform_stack);
     // The transformation graph isn't directional (because STEP is a Good File
     // Format), so if it's got more than one root, assume it's backwards.  We
@@ -99,7 +99,7 @@ pub fn triangulate(s: &StepFile) -> Result<(Mesh, Stats), Error> {
     // until we find a counterexample.
     if roots.len() > 1 {
         info!("Flipping transform stack");
-        transform_stack = build_transform_stack(s, true);
+        transform_stack = build_transform_stack(s, true)?;
         roots = transform_stack_roots(&transform_stack);
     }
     let mut todo: Vec<_> = roots.into_iter()
@@ -294,24 +294,24 @@ pub fn triangulate(s: &StepFile) -> Result<(Mesh, Stats), Error> {
     Ok((mesh, stats))
 }
 
-fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> DMat4 {
-    let i = s.entity(t).expect("Could not get ItemDefinedTransform");
+fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> Result<DMat4, Error> {
+    let i = s.entity(t).ok_or(Error::InvalidPlacement)?;
 
     let (location, axis, ref_direction) = axis2_placement_3d(s,
-        i.transform_item_1.cast());
+        i.transform_item_1.cast())?;
     let t1 = Surface::make_affine_transform(axis,
         ref_direction,
         axis.cross(&ref_direction),
         location);
 
     let (location, axis, ref_direction) = axis2_placement_3d(s,
-        i.transform_item_2.cast());
+        i.transform_item_2.cast())?;
     let t2 = Surface::make_affine_transform(axis,
         ref_direction,
         axis.cross(&ref_direction),
         location);
 
-    t2 * t1.try_inverse().expect("Could not invert transform matrix")
+    Ok(t2 * t1.try_inverse().ok_or(Error::InvalidPlacement)?)
 }
 
 fn presentation_style_color(s: &StepFile, p: PresentationStyleAssignment)
@@ -356,23 +356,37 @@ fn cartesian_point(s: &StepFile, a: Id<CartesianPoint_>) -> DVec3 {
     DVec3::new(p.coordinates[0].0, p.coordinates[1].0, p.coordinates[2].0)
 }
 
-fn direction(s: &StepFile, a: Direction) -> DVec3 {
-    let p = s.entity(a).expect("Could not get cartesian point");
-    DVec3::new(p.direction_ratios[0],
-               p.direction_ratios[1],
-               p.direction_ratios[2])
+fn direction(s: &StepFile, a: Direction) -> Result<DVec3, Error> {
+    let entity = s.entity(a).ok_or(Error::InvalidPlacement)?;
+    let [x, y, z] = entity.direction_ratios.as_slice() else {
+        return Err(Error::InvalidPlacement);
+    };
+    let scale = x.abs().max(y.abs()).max(z.abs());
+    if scale == 0.0 || ![x, y, z].iter().all(|value| value.is_finite()) {
+        return Err(Error::InvalidPlacement);
+    }
+    Ok(DVec3::new(x / scale, y / scale, z / scale).normalize())
 }
 
-fn axis2_placement_3d(s: &StepFile, t: Id<Axis2Placement3d_>) -> (DVec3, DVec3, DVec3) {
-    let a = s.entity(t).expect("Could not get Axis2Placement3d");
+fn axis2_placement_3d(
+    s: &StepFile, t: Id<Axis2Placement3d_>,
+) -> Result<(DVec3, DVec3, DVec3), Error> {
+    let a = s.entity(t).ok_or(Error::InvalidPlacement)?;
     let location = cartesian_point(s, a.location);
-    // TODO: this doesn't necessarily match the behavior of `build_axes`
-    let axis = direction(s, a.axis.expect("Missing axis"));
-    let ref_direction = match a.ref_direction {
-        None => DVec3::new(1.0, 0.0, 0.0),
-        Some(r) => direction(s, r),
+    if !location.iter().all(|value| value.is_finite()) {
+        return Err(Error::InvalidPlacement);
+    }
+    let axis = a.axis.map(|id| direction(s, id)).transpose()?.unwrap_or(DVec3::z());
+    let reference = match a.ref_direction {
+        Some(id) => direction(s, id)?,
+        // When X is parallel to the axis, project Y instead.
+        None if axis.cross(&DVec3::x()).norm() < 1e-10 => DVec3::y(),
+        None => DVec3::x(),
     };
-    (location, axis, ref_direction)
+    let ref_direction = (reference - axis * axis.dot(&reference))
+        .try_normalize(1e-10)
+        .ok_or(Error::InvalidPlacement)?;
+    Ok((location, axis, ref_direction))
 }
 
 fn enforce_mesh_limit(vertices: usize, triangles: usize) -> Result<(), Error> {
@@ -670,28 +684,28 @@ fn rings_match(a: &[DVec3], b: &[DVec3]) -> bool {
 fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
     match &s[surf] {
         Entity::CylindricalSurface(c) => {
-            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position);
+            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position)?;
             Ok(Surface::new_cylinder(axis, ref_direction, location, c.radius.0.0.0))
         },
         Entity::ToroidalSurface(c) => {
-            let (location, axis, _ref_direction) = axis2_placement_3d(s, c.position);
+            let (location, axis, _ref_direction) = axis2_placement_3d(s, c.position)?;
             Ok(Surface::new_torus(location, axis, c.major_radius.0.0.0, c.minor_radius.0.0.0))
         },
         Entity::Plane(p) => {
             // We'll ignore axis and ref_direction in favor of building an
             // orthonormal basis later on
-            let (location, axis, ref_direction) = axis2_placement_3d(s, p.position);
+            let (location, axis, ref_direction) = axis2_placement_3d(s, p.position)?;
             Ok(Surface::new_plane(axis, ref_direction, location))
         },
         // We treat cones like planes, since that's a valid mapping into 2D
         Entity::ConicalSurface(c) => {
-            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position);
+            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position)?;
             Ok(Surface::new_cone(axis, ref_direction, location, c.semi_angle.0))
         },
         Entity::SphericalSurface(c) => {
             // We'll ignore axis and ref_direction in favor of building an
             // orthonormal basis later on
-            let (location, _axis, _ref_direction) = axis2_placement_3d(s, c.position);
+            let (location, _axis, _ref_direction) = axis2_placement_3d(s, c.position)?;
             Ok(Surface::new_sphere(location, c.radius.0.0.0))
         },
         Entity::BSplineSurfaceWithKnots(b) =>
@@ -701,8 +715,8 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
             let control_points_list = control_points_2d(s, &b.control_points_list);
 
             let surf = BSplineSurface::new(
-                b.u_closed.0.unwrap() == false,
-                b.v_closed.0.unwrap() == false,
+                b.u_closed.0 != Some(true),
+                b.v_closed.0 != Some(true),
                 u_knot_vec,
                 v_knot_vec,
                 control_points_list,
@@ -737,8 +751,8 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
                 .collect();
 
             let surf = NURBSSurface::new(
-                bspline.u_closed.0.unwrap() == false,
-                bspline.v_closed.0.unwrap() == false,
+                bspline.u_closed.0 != Some(true),
+                bspline.v_closed.0 != Some(true),
                 u_knot_vec,
                 v_knot_vec,
                 control_points_list,
@@ -887,13 +901,13 @@ fn curve<'a>(s: &StepFile<'a>, edge_curve: &ap214::EdgeCurve_<'a>,
     };
     Ok(match geometry {
         Entity::Circle(c) => {
-            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position.cast());
+            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position.cast())?;
             Curve::new_circle(location, axis, ref_direction, c.radius.0.0.0,
                               edge_curve.edge_start == edge_curve.edge_end,
                               edge_curve.same_sense ^ !orientation)
         },
         Entity::Ellipse(c) => {
-            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position.cast());
+            let (location, axis, ref_direction) = axis2_placement_3d(s, c.position.cast())?;
             Curve::new_ellipse(location, axis, ref_direction,
                                c.semi_axis_1.0.0.0, c.semi_axis_2.0.0.0,
                                edge_curve.edge_start == edge_curve.edge_end,
