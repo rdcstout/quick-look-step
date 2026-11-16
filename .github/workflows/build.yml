@@ -1,11 +1,15 @@
-name: Build and Notarize
+name: Build and Package
 
 on:
   push:
     branches: [main]
-    tags: ["release/v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      package_candidate:
+        description: Sign and notarize a candidate for installation testing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,13 +35,11 @@ jobs:
           make test-foxtrot xcodebuild
           codesign --verify --deep --strict build/Build/Products/Debug/QuickLookStep.app
 
-  release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release/v')
+  package:
+    if: github.event_name == 'workflow_dispatch' && inputs.package_candidate
     needs: verify
     runs-on: macos-26
     environment: release
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -96,8 +98,3 @@ jobs:
           name: QuickLookStep
           path: build/QuickLookStep.zip
           if-no-files-found: error
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: build/QuickLookStep.zip

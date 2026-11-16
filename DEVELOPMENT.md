@@ -22,4 +22,4 @@ When Finder shows only a generic file icon, check the resolved type with `mdls -
 
 ## Continuous integration and signing
 
-The [GitHub Actions workflow](.github/workflows/build.yml) runs the build and Rust checks on macOS 26 and the Xcode 27 runner. CI does not exercise the Finder interface. Developer ID signing and notarization run through the [release workflow](.github/workflows/README.md) on a release-tag push. Establish the signing environment and verify the resulting app before publishing a release tag.
+The [GitHub Actions workflow](.github/workflows/build.yml) runs the build and Rust checks on macOS 26 and the Xcode 27 runner. CI does not exercise the Finder interface. Developer ID signing and notarization run through the manual [candidate packaging workflow](.github/workflows/README.md). Install and verify the exact package before publishing it.
