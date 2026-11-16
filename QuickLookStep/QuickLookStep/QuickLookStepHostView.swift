@@ -5,7 +5,7 @@ import Metal
 import AppKit
 import UniformTypeIdentifiers
 
-/// Root UI used inside the demo host macOS app.  Drop a .step file to view it.
+/// Explains Finder setup and supports opening a STEP model in the app.
 struct QuickLookStepHostView: View {
     private static let loadQueue = DispatchQueue(label: "com.rdcstout.QuickLookStep.file", qos: .userInitiated)
 
@@ -21,9 +21,7 @@ struct QuickLookStepHostView: View {
                 SceneKitView(scene: scene)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Text("Drop a STEP file")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
+                setupInstructions
             }
 
             if let message = loadError ?? geometryWarning {
@@ -35,7 +33,7 @@ struct QuickLookStepHostView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity) // fill the window
+        .frame(minWidth: 400, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
         .contentShape(Rectangle()) // define hit-test area after sizing
         .onDrop(of: [UTType.fileURL, UTType.url, UTType.item], isTargeted: $isTargeted) { providers in
             var collected: [URL] = []
@@ -89,6 +87,28 @@ struct QuickLookStepHostView: View {
         }
     }
 
+    private var setupInstructions: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Preview STEP files in Finder")
+                .font(.title2.bold())
+                .accessibilityAddTraits(.isHeader)
+
+            Text("In Finder, select a .step or .stp file and press Space.")
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("First-time setup")
+                    .font(.headline)
+                Text("In System Settings, go to General → Login Items & Extensions → Quick Look and enable the Quick Look STEP extensions.")
+            }
+
+            Text("You can close this app after setup.")
+                .foregroundStyle(.secondary)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: 400, alignment: .leading)
+        .padding(24)
+    }
+
     // MARK: - Loading & snapshot
     private func loadStep(_ url: URL) {
         loadError = nil
@@ -117,5 +137,3 @@ struct QuickLookStepHostView: View {
         }
     }
 }
-
-// MARK: - Drag & Drop helper (legacy – unused) 
