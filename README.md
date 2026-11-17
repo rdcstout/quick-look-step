@@ -8,7 +8,7 @@ Preview `.step` and `.stp` models and see their thumbnails in macOS Finder.
 
 Originally created by [John Boiles](https://github.com/johnboiles/quick-look-step). This independent fork is maintained by [Extrusion Therapy](https://extrusiontherapy.com).
 
-Open the disk image, drag **Quick Look STEP** to **Applications**, and open it once. Click **Enable or Disable…** and turn on the Quick Look STEP extensions in System Settings. Then select a STEP file in Finder and press **Space**. Some complex surfaces can be omitted, and the preview displays a warning when that happens.
+After setup, select a `.step` or `.stp` file in Finder and press **Space**. Some complex surfaces can be omitted, and the preview displays a warning when that happens.
 
 [Report an issue](https://github.com/rdcstout/quick-look-step/issues) · [Report a security issue privately](SECURITY.md) · [Build from source](DEVELOPMENT.md) · [Support Future Tools](https://buy.stripe.com/fZu3cw2Mnfr0d7N3ws1kA00)
 

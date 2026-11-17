@@ -3,7 +3,7 @@
 The download is for Apple silicon Macs. Finder previews, thumbnails, and installation are tested on macOS 27.2.1.
 
 1. Open the downloaded DMG.
-2. Drag **Quick Look STEP** onto the **Applications** shortcut in the disk image.
+2. Copy **Quick Look STEP** from the disk image to your **Applications** folder.
 3. Open **Quick Look STEP** once from Applications.
 4. Click **Enable or Disable…**. In the Extensions section of System Settings, select **By App** if needed, then open the details for **Quick Look STEP** and turn on both switches.
 5. Eject the disk image. In Finder, select a `.step` or `.stp` file and press **Space**. The app can be closed while Finder previews files.
